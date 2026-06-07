@@ -1,9 +1,3 @@
-//! Layout engine — turns a styled DOM into a Box tree (cells).
-//! Single-column block formatting: block-level children stack vertically with
-//! collapsing vertical margins; inline-level content (text + inline elements)
-//! is gathered into words and wrapped into `line` boxes at the viewport width.
-//! Flex/grid come in v0.3; this is block + inline only.
-
 const std = @import("std");
 const dom = @import("../dom/node.zig");
 const style = @import("../css/style.zig");
@@ -14,14 +8,11 @@ const Box = boxmod.Box;
 const Rect = boxmod.Rect;
 const ComputedStyle = style.ComputedStyle;
 
-/// A focusable form control the viewer can edit or activate.
 pub const Field = struct {
     node: *dom.Node,
     kind: forms.Kind,
 };
 
-/// One atomic piece of inline content: a word painted with `cs`, or a forced
-/// line break (from <br>). `link` is the 1-based hint number if inside an <a>.
 const Word = struct {
     text: []const u8 = "",
     cs: *const ComputedStyle,
@@ -32,19 +23,16 @@ const Word = struct {
 const Ctx = struct {
     a: std.mem.Allocator,
     width: u16,
-    links: *std.ArrayList([]const u8), // href table; index+1 = link hint number
-    fields: *std.ArrayList(Field), // form controls; index+1 = field hint number
+    links: *std.ArrayList([]const u8),
+    fields: *std.ArrayList(Field),
 };
 
-/// A laid-out page: the root box plus the tables the viewer drives — links to
-/// follow (hint N = links[N-1]) and form fields to edit (hint N = fields[N-1]).
 pub const Page = struct {
     root: Box,
     links: []const []const u8,
     fields: []const Field,
 };
 
-/// Lay out the whole document at `width` cells.
 pub fn layout(a: std.mem.Allocator, doc: *dom.Document, width: u16) !Page {
     var links: std.ArrayList([]const u8) = .empty;
     var fields: std.ArrayList(Field) = .empty;
@@ -63,16 +51,13 @@ pub fn layout(a: std.mem.Allocator, doc: *dom.Document, width: u16) !Page {
     };
 }
 
-/// Lay out the contents of `node` into `out`. Block-level children become block
-/// boxes; runs of inline-level content become line boxes. Returns the y just
-/// past the last line produced.
 fn layoutContainer(
     ctx: *Ctx,
     node: *dom.Node,
     x: u16,
     avail_w: u16,
     start_y: u16,
-    bullet: ?*const ComputedStyle, // non-null => seed a "• " marker (list-item)
+    bullet: ?*const ComputedStyle,
     out: *std.ArrayList(Box),
 ) !u16 {
     var y = start_y;
@@ -90,7 +75,6 @@ fn layoutContainer(
         if (disp == .none) continue;
 
         if (disp == .block or disp == .list_item) {
-            // flush any pending inline content before the block
             if (pending.items.len > 0) {
                 y = try wrapWords(ctx, pending.items, x, avail_w, y, out);
                 pending.clearRetainingCapacity();
@@ -114,7 +98,6 @@ fn layoutContainer(
     return y;
 }
 
-/// Lay out a single block-level element starting at (x, y).
 fn layoutBlock(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, y: u16) std.mem.Allocator.Error!Box {
     var children: std.ArrayList(Box) = .empty;
     const cs = node.computed;
@@ -135,9 +118,7 @@ fn layoutBlock(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, y: u16) std.mem
     };
 }
 
-/// white-space:pre — keep text verbatim, one line box per source line, no wrap.
 fn layoutPre(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, start_y: u16, out: *std.ArrayList(Box)) !u16 {
-    // text lives in the arena: line boxes keep slices into it.
     var text: std.ArrayList(u8) = .empty;
     node.appendText(ctx.a, &text) catch {};
     const cs = node.computed;
@@ -165,10 +146,6 @@ fn layoutPre(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, start_y: u16, out
     return y;
 }
 
-/// Walk an inline subtree collecting words. <br> yields a forced break; runs of
-/// whitespace become word boundaries (collapsed to single spaces at wrap time).
-/// `link` is the enclosing anchor's hint number (0 = none); an <a href> opens a
-/// new one, registers its href, and emits a "[n] " hint marker.
 fn collectInline(ctx: *Ctx, node: *dom.Node, link: u16, out: *std.ArrayList(Word)) !void {
     switch (node.kind) {
         .text => {
@@ -185,7 +162,7 @@ fn collectInline(ctx: *Ctx, node: *dom.Node, link: u16, out: *std.ArrayList(Word
             }
             if (isControl(node.tag)) {
                 try emitField(ctx, node, cs orelse return, out);
-                return; // controls don't descend (value already captured)
+                return;
             }
             var cur = link;
             if (std.mem.eql(u8, node.tag, "a")) {
@@ -210,9 +187,6 @@ fn isControl(tag: []const u8) bool {
         std.mem.eql(u8, tag, "button");
 }
 
-/// Render a form control as a single inline atom: a "{n}" hint plus a bracketed
-/// value/label box, and register it as field n. Hidden inputs are submitted but
-/// not shown or focusable.
 fn emitField(ctx: *Ctx, node: *dom.Node, cs: *const ComputedStyle, out: *std.ArrayList(Word)) !void {
     const k = forms.kind(node);
     if (k == .hidden) return;
@@ -233,11 +207,9 @@ fn emitField(ctx: *Ctx, node: *dom.Node, cs: *const ComputedStyle, out: *std.Arr
         },
         else => try fieldBox(ctx.a, n, val, node),
     };
-    // one atom (may contain spaces) so wrapping treats the field as a unit
     try out.append(ctx.a, .{ .text = text, .cs = cs });
 }
 
-/// "{n}[value padded to the field's size]" — gives an empty field visible width.
 fn fieldBox(a: std.mem.Allocator, n: usize, val: []const u8, node: *dom.Node) ![]const u8 {
     const size: usize = if (node.attr("size")) |s| (std.fmt.parseInt(usize, s, 10) catch 20) else 20;
     const shown = @max(size, boxmod.cellWidth(val));
@@ -247,8 +219,6 @@ fn fieldBox(a: std.mem.Allocator, n: usize, val: []const u8, node: *dom.Node) ![
     return std.fmt.allocPrint(a, "{{{d}}}[{s}]", .{ n, inner.items });
 }
 
-/// Greedy line-breaking: place words left→right, wrapping when the next word
-/// would overflow `avail_w`. Emits one `line` box per visual line.
 fn wrapWords(ctx: *Ctx, words: []const Word, x: u16, avail_w: u16, start_y: u16, out: *std.ArrayList(Box)) !u16 {
     var y = start_y;
     var line: std.ArrayList(Box) = .empty;
@@ -262,7 +232,7 @@ fn wrapWords(ctx: *Ctx, words: []const Word, x: u16, avail_w: u16, start_y: u16,
                 y += 1;
                 cur_x = x;
             } else {
-                y += 1; // blank line
+                y += 1;
             }
             continue;
         }
@@ -273,7 +243,7 @@ fn wrapWords(ctx: *Ctx, words: []const Word, x: u16, avail_w: u16, start_y: u16,
             y += 1;
             cur_x = x;
         }
-        if (line.items.len > 0) cur_x += 1; // the collapsed space
+        if (line.items.len > 0) cur_x += 1;
         try line.append(ctx.a, .{
             .kind = .text,
             .rect = .{ .x = cur_x, .y = y, .w = ww, .h = 1 },
@@ -298,8 +268,6 @@ fn emitLine(ctx: *Ctx, line: *std.ArrayList(Box), x: u16, cur_x: u16, y: u16, ou
     });
 }
 
-// --- tests ---
-
 const testing = std.testing;
 const html = @import("../html/parser.zig");
 const cascade = @import("../css/cascade.zig");
@@ -311,7 +279,6 @@ fn styledDoc(src: []const u8) !dom.Document {
     return doc;
 }
 
-/// Collect all text-run boxes in tree order.
 fn collectText(box: Box, out: *std.ArrayList(Box)) !void {
     if (box.kind == .text) try out.append(testing.allocator, box);
     for (box.children) |c| try collectText(c, out);
@@ -320,18 +287,16 @@ fn collectText(box: Box, out: *std.ArrayList(Box)) !void {
 test "inline text wraps at width" {
     var doc = try styledDoc("<body><p>aaa bbb ccc ddd</p></body>");
     defer doc.deinit();
-    // width 7 fits "aaa bbb" (7) then wraps "ccc ddd"
     const root = (try layout(doc.alloc(), &doc, 7)).root;
     var runs: std.ArrayList(Box) = .empty;
     defer runs.deinit(testing.allocator);
     try collectText(root, &runs);
     try testing.expectEqual(@as(usize, 4), runs.items.len);
-    // first two words on row 0, next two on row 1
     try testing.expectEqual(@as(u16, 0), runs.items[0].rect.y);
     try testing.expectEqual(@as(u16, 0), runs.items[1].rect.y);
     try testing.expectEqual(@as(u16, 1), runs.items[2].rect.y);
     try testing.expectEqualStrings("ccc", runs.items[2].text);
-    try testing.expectEqual(@as(u16, 0), runs.items[2].rect.x); // wrapped to col 0
+    try testing.expectEqual(@as(u16, 0), runs.items[2].rect.x);
 }
 
 test "blocks stack with collapsing margins" {
@@ -343,7 +308,6 @@ test "blocks stack with collapsing margins" {
     try collectText(root, &runs);
     try testing.expectEqual(@as(usize, 2), runs.items.len);
     try testing.expectEqualStrings("one", runs.items[0].text);
-    // "two" sits one blank line below "one" (margins 1+1 collapse to 1)
     try testing.expectEqual(@as(u16, 0), runs.items[0].rect.y);
     try testing.expectEqual(@as(u16, 2), runs.items[1].rect.y);
 }
@@ -355,7 +319,6 @@ test "list items get a bullet" {
     var runs: std.ArrayList(Box) = .empty;
     defer runs.deinit(testing.allocator);
     try collectText(root, &runs);
-    // each li: bullet run + word run
     try testing.expectEqualStrings("\u{2022} ", runs.items[0].text);
     try testing.expectEqualStrings("x", runs.items[1].text);
     try testing.expectEqualStrings("\u{2022} ", runs.items[2].text);
@@ -384,8 +347,7 @@ test "links collected with hint numbers and hrefs" {
     var runs: std.ArrayList(Box) = .empty;
     defer runs.deinit(testing.allocator);
     try collectText(pg.root, &runs);
-    // first run is the "[1]" hint carrying link number 1
     try testing.expectEqualStrings("[1]", runs.items[0].text);
     try testing.expectEqual(@as(u16, 1), runs.items[0].link);
-    try testing.expectEqual(@as(u16, 1), runs.items[1].link); // "one"
+    try testing.expectEqual(@as(u16, 1), runs.items[1].link);
 }

@@ -1,9 +1,3 @@
-//! HTML tree builder — turns tokens into a DOM Document.
-//! Pragmatic, not full-spec: a stack of open elements, void elements that never
-//! push, lenient end-tag matching, raw-text element handling, entity-decoded
-//! text nodes. Good enough to build a real tree for typical pages; the gnarly
-//! HTML5 insertion-mode rules can come later if pages need them.
-
 const std = @import("std");
 const dom = @import("../dom/node.zig");
 const tok = @import("tokenizer.zig");
@@ -29,7 +23,6 @@ pub fn parse(gpa: std.mem.Allocator, src: []const u8) !dom.Document {
             },
             .end_tag => |name| closeElement(&stack, name),
             .start_tag => |st| {
-                // Copy attrs into the doc arena as dom.Attr.
                 const attrs = try a.alloc(dom.Attr, st.attrs.len);
                 for (st.attrs, 0..) |src_attr, i| {
                     attrs[i] = .{ .name = src_attr.name, .value = src_attr.value };
@@ -38,7 +31,6 @@ pub fn parse(gpa: std.mem.Allocator, src: []const u8) !dom.Document {
                 current.appendChild(el);
 
                 if (std.mem.eql(u8, st.name, "title")) {
-                    // capture document title from raw-text body
                     const body = t.rawTextUntil(st.name);
                     doc.title = try decodeEntities(a, std.mem.trim(u8, body, " \t\r\n"));
                     el.appendChild(try doc.createText(doc.title));
@@ -46,8 +38,6 @@ pub fn parse(gpa: std.mem.Allocator, src: []const u8) !dom.Document {
                 }
                 if (tok.isRawText(st.name)) {
                     const body = t.rawTextUntil(st.name);
-                    // script/style bodies are not user-visible text; keep verbatim
-                    // so later stages can decide. Don't entity-decode them.
                     el.appendChild(try doc.createText(body));
                     continue;
                 }
@@ -59,11 +49,9 @@ pub fn parse(gpa: std.mem.Allocator, src: []const u8) !dom.Document {
     return doc;
 }
 
-/// Pop the stack to the nearest matching open element. If none matches, ignore
-/// the stray end tag (lenient).
 fn closeElement(stack: *std.ArrayList(*dom.Node), name: []const u8) void {
     var i = stack.items.len;
-    while (i > 1) { // never pop the document root at index 0
+    while (i > 1) {
         i -= 1;
         if (std.mem.eql(u8, stack.items[i].tag, name)) {
             stack.shrinkRetainingCapacity(i);
@@ -83,10 +71,8 @@ fn isVoid(name: []const u8) bool {
 
 const Entity = struct { bytes: []const u8, len: usize };
 
-/// Decode HTML entities into a freshly allocated string. Covers common named
-/// entities + decimal/hex numeric refs; unknown refs pass through verbatim.
 pub fn decodeEntities(a: std.mem.Allocator, s: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, s, '&') == null) return s; // fast path
+    if (std.mem.indexOfScalar(u8, s, '&') == null) return s;
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
@@ -121,7 +107,6 @@ fn decodeOne(s: []const u8) ?Entity {
         if (s.len >= p[0].len and std.mem.eql(u8, s[0..p[0].len], p[0]))
             return .{ .bytes = p[1], .len = p[0].len };
     }
-    // numeric: &#123; or &#x1F;
     if (s.len >= 3 and s[1] == '#') {
         var j: usize = 2;
         var hex = false;
@@ -145,7 +130,6 @@ test "parse builds a tree, decodes entities, sets title" {
     defer doc.deinit();
     try std.testing.expectEqualStrings("Hi & Bye", doc.title);
 
-    // root > html > {head, body}
     const html = doc.root.first_child.?;
     try std.testing.expectEqualStrings("html", html.tag);
     const head = html.first_child.?;
@@ -153,7 +137,6 @@ test "parse builds a tree, decodes entities, sets title" {
     const body = head.next_sibling.?;
     try std.testing.expectEqualStrings("body", body.tag);
 
-    // body > p > {text "x", br(void, no children), text "y"}
     const p = body.first_child.?;
     try std.testing.expectEqualStrings("p", p.tag);
     const x = p.first_child.?;

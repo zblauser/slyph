@@ -1,7 +1,3 @@
-//! DOM node tree — the central shared structure (see ARCH.md).
-//! html/ builds it; css/ + layout/ will annotate it; render/ reads it.
-//! All nodes live in a Document arena, freed on navigation.
-
 const std = @import("std");
 const style = @import("../css/style.zig");
 
@@ -14,10 +10,8 @@ pub const Attr = struct {
 
 pub const Node = struct {
     kind: Kind,
-    /// element only — lowercased tag name
     tag: []const u8 = "",
     attrs: []Attr = &.{},
-    /// text / comment payload (already entity-decoded for text nodes)
     text: []const u8 = "",
 
     parent: ?*Node = null,
@@ -25,10 +19,7 @@ pub const Node = struct {
     last_child: ?*Node = null,
     next_sibling: ?*Node = null,
 
-    /// Set by css/ cascade. null until styled.
     computed: ?*style.ComputedStyle = null,
-    /// Mutable form-control state (input/textarea), seeded by forms.init and
-    /// edited in the viewer. null for non-controls / before init.
     value: ?[]const u8 = null,
 
     pub fn appendChild(self: *Node, child: *Node) void {
@@ -48,8 +39,6 @@ pub const Node = struct {
         return null;
     }
 
-    /// Concatenate the text of every descendant text node (depth-first).
-    /// Shared by css/ (<style> contents) and layout/ (pre / raw text).
     pub fn appendText(self: *const Node, a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         var child = self.first_child;
         while (child) |c| : (child = c.next_sibling) {
@@ -62,7 +51,6 @@ pub const Node = struct {
     }
 };
 
-/// Owns the arena that backs every Node. Drop it to free the whole page.
 pub const Document = struct {
     arena: std.heap.ArenaAllocator,
     root: *Node,

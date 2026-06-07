@@ -1,24 +1,16 @@
-//! Interactive terminal viewer — the browser chrome (DESIGN.md: keyboard-only,
-//! vim-ish, anti-mouse). Scrolls a fully rendered frame in the alternate screen
-//! and drives navigation + form editing. Scrolling is a cheap row-slice of the
-//! pre-rendered frame — no relayout per keystroke (the Box-tree payoff).
-//!
-//! Keys: j/k line, d/u or space/b half-page, g/G top/bottom,
-//!       f follow a [n] link, i edit/activate a {n} field, H back, q quit.
-
 const std = @import("std");
 const posix = std.posix;
 const engine = @import("../layout/engine.zig");
 const forms = @import("../forms/forms.zig");
 
-/// What the user asked for when the viewer returns.
 pub const Action = union(enum) {
     quit,
     back,
-    follow: []const u8, // href to navigate to
-    edit: struct { field: usize, value: []const u8 }, // set fields[field].value (gpa-owned)
-    toggle: usize, // flip a checkbox/radio (index into fields)
-    submit: usize, // activate submit field (index into fields)
+    follow: []const u8,
+    navigate: []const u8,
+    edit: struct { field: usize, value: []const u8 },
+    toggle: usize,
+    submit: usize,
 };
 
 pub fn view(
@@ -30,7 +22,7 @@ pub fn view(
     cols: u16,
     rows: u16,
     bar: []const u8,
-    scroll: *usize, // preserved across re-entry (e.g. after an edit)
+    scroll: *usize,
 ) !Action {
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(gpa);
@@ -43,7 +35,7 @@ pub fn view(
     try out.writeStreamingAll(io, enter_ui);
     defer out.writeStreamingAll(io, exit_ui) catch {};
 
-    const page: u16 = if (rows > 1) rows - 1 else 1; // reserve status bar
+    const page: u16 = if (rows > 1) rows - 1 else 1;
     const max_scroll: usize = if (lines.items.len > page) lines.items.len - page else 0;
     scroll.* = @min(scroll.*, max_scroll);
 
@@ -64,6 +56,12 @@ pub fn view(
             'f' => {
                 if (try promptIndex(gpa, io, out, &buf, cols, rows, "follow link", links.len)) |n|
                     return .{ .follow = links[n - 1] };
+            },
+            0x0c, ':' => {
+                if (try promptText(gpa, io, out, &buf, cols, rows, "url", "")) |u| {
+                    if (u.len > 0) return .{ .navigate = u };
+                    gpa.free(u);
+                }
             },
             'i' => {
                 if (try promptIndex(gpa, io, out, &buf, cols, rows, "field", fields.len)) |n| {
@@ -119,7 +117,6 @@ fn statusBar(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8, 
     try buf.appendSlice(gpa, "\x1b[0m");
 }
 
-/// Prompt for a 1-based index in [1, count]; returns null on cancel/out-of-range.
 fn promptIndex(gpa: std.mem.Allocator, io: std.Io, out: std.Io.File, buf: *std.ArrayList(u8), cols: u16, rows: u16, label: []const u8, count: usize) !?usize {
     const s = (try promptText(gpa, io, out, buf, cols, rows, label, "")) orelse return null;
     defer gpa.free(s);
@@ -127,8 +124,6 @@ fn promptIndex(gpa: std.mem.Allocator, io: std.Io, out: std.Io.File, buf: *std.A
     return if (n >= 1 and n <= count) n else null;
 }
 
-/// Edit a line of text on the status bar. Enter confirms (returns a gpa-owned
-/// copy), Esc cancels (null). Backspace edits; printable bytes append.
 fn promptText(gpa: std.mem.Allocator, io: std.Io, out: std.Io.File, buf: *std.ArrayList(u8), cols: u16, rows: u16, label: []const u8, initial: []const u8) !?[]u8 {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
@@ -148,7 +143,7 @@ fn promptText(gpa: std.mem.Allocator, io: std.Io, out: std.Io.File, buf: *std.Ar
 
         switch (readByte() orelse return null) {
             '\r', '\n' => return try text.toOwnedSlice(gpa),
-            0x1b => return null, // Esc
+            0x1b => return null,
             0x7f, 0x08 => if (text.items.len > 0) {
                 _ = text.pop();
             },
@@ -157,12 +152,9 @@ fn promptText(gpa: std.mem.Allocator, io: std.Io, out: std.Io.File, buf: *std.Ar
     }
 }
 
-// --- terminal control ---
+const enter_ui = "\x1b[?1049h\x1b[?25l";
+const exit_ui = "\x1b[?25h\x1b[?1049l";
 
-const enter_ui = "\x1b[?1049h\x1b[?25l"; // alt screen, hide cursor
-const exit_ui = "\x1b[?25h\x1b[?1049l"; // show cursor, leave alt screen
-
-/// cbreak mode: keys read unbuffered, no echo. ISIG stays on so Ctrl-C works.
 fn enterRaw() !posix.termios {
     const saved = try posix.tcgetattr(posix.STDIN_FILENO);
     var raw = saved;

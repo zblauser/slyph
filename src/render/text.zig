@@ -1,16 +1,9 @@
-//! Text render backend — walks a Box tree and emits the terminal result.
-//! Boxes are already in visual order with absolute cell coords, so a single
-//! in-order walk reproduces the page: advance the cursor with spaces/newlines to
-//! each run's (x, y), then write it with ANSI styling. ANSI is gated on `ansi`
-//! so piping to a file or a dumb terminal yields clean text (DESIGN.md).
-
 const std = @import("std");
 const boxmod = @import("../layout/box.zig");
 const style = @import("../css/style.zig");
 
 const Box = boxmod.Box;
 
-/// Render `root` to an owned byte buffer. `ansi` enables SGR styling.
 pub fn render(a: std.mem.Allocator, root: Box, ansi: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var c = Cursor{ .a = a, .out = &out, .ansi = ansi };
@@ -35,7 +28,6 @@ const Cursor = struct {
         for (box.children) |child| try self.walk(child);
     }
 
-    /// Advance the cursor to (x, y) with newlines then spaces.
     fn moveTo(self: *Cursor, x: u16, y: u16) !void {
         while (self.row < y) : (self.row += 1) {
             try self.out.append(self.a, '\n');
@@ -55,8 +47,6 @@ const Cursor = struct {
     }
 };
 
-/// Write the SGR escape opening this style's attributes. Returns true if any
-/// were written (so the caller knows to reset afterward).
 fn openSgr(a: std.mem.Allocator, out: *std.ArrayList(u8), cs: *const style.ComputedStyle) !bool {
     var w: std.ArrayList(u8) = .empty;
     defer w.deinit(a);
@@ -78,8 +68,6 @@ fn appendCode(a: std.mem.Allocator, w: *std.ArrayList(u8), code: []const u8) !vo
     if (w.items.len > 0) try w.append(a, ';');
     try w.appendSlice(a, code);
 }
-
-// --- tests ---
 
 const testing = std.testing;
 const html = @import("../html/parser.zig");
@@ -115,7 +103,6 @@ test "wrapping inserts newline at width" {
 test "ansi wraps bold and underline, link gets [n] hint" {
     const out = try renderHtml("<body><p><b>hi</b> <a href=x>link</a></p></body>", 80, true);
     defer testing.allocator.free(out);
-    // bold "hi", then underlined "[1]" hint + underlined "link"
     try testing.expectEqualStrings("\x1b[1mhi\x1b[0m \x1b[4m[1]\x1b[0m \x1b[4mlink\x1b[0m\n", out);
 }
 

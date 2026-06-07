@@ -1,8 +1,3 @@
-//! CSS cascade — matches parsed rules against the DOM and writes a
-//! ComputedStyle onto every node. Origins are ordered UA < author < inline;
-//! within an origin the winner is highest specificity, then source order.
-//! Pragmatic: enough properties for text-mode layout + terminal styling.
-
 const std = @import("std");
 const dom = @import("../dom/node.zig");
 const style = @import("style.zig");
@@ -10,8 +5,6 @@ const css = @import("parser.zig");
 
 const ComputedStyle = style.ComputedStyle;
 
-/// Built-in user-agent stylesheet: gives elements their default display and the
-/// handful of text decorations the terminal renderer can show.
 pub const ua_css =
     \\html, body, div, section, article, header, footer, main, nav, aside,
     \\p, ul, ol, li, dl, dt, dd, table, tr, figure, figcaption, blockquote,
@@ -28,21 +21,18 @@ pub const ua_css =
 
 const Origin = enum(u2) { ua = 0, author = 1, inline_ = 2 };
 
-/// A rule tagged with where it came from and its source position.
 const TaggedRule = struct {
     origin: Origin,
     order: u32,
     rule: css.Rule,
 };
 
-/// A declaration that matched an element, with its full cascade sort key.
 const Candidate = struct {
     origin: Origin,
     specificity: u32,
     order: u32,
     decls: []css.Declaration,
 
-    /// Ascending order = lowest priority first (applied first, overridden later).
     fn lessThan(_: void, a: Candidate, b: Candidate) bool {
         if (a.origin != b.origin) return @intFromEnum(a.origin) < @intFromEnum(b.origin);
         if (a.specificity != b.specificity) return a.specificity < b.specificity;
@@ -50,29 +40,24 @@ const Candidate = struct {
     }
 };
 
-/// Style the whole document in place: every node gets `computed` set.
 pub fn apply(a: std.mem.Allocator, doc: *dom.Document) !void {
     var rules: std.ArrayList(TaggedRule) = .empty;
     defer rules.deinit(a);
     var order: u32 = 0;
 
-    // 1. UA stylesheet
     const ua = try css.parse(a, ua_css);
     for (ua.rules) |r| {
         try rules.append(a, .{ .origin = .ua, .order = order, .rule = r });
         order += 1;
     }
-    // 2. author <style> elements, in document order
     try collectStyleElements(a, doc.root, &rules, &order);
 
     const styler = Styler{ .a = a, .rules = rules.items };
     try styler.styleNode(doc.root, ComputedStyle.initial);
 }
 
-/// Walk the tree collecting the text of every <style> element and parsing it.
 fn collectStyleElements(a: std.mem.Allocator, node: *dom.Node, rules: *std.ArrayList(TaggedRule), order: *u32) !void {
     if (node.kind == .element and std.mem.eql(u8, node.tag, "style")) {
-        // text lives in the arena: css.parse keeps slices into it.
         var text: std.ArrayList(u8) = .empty;
         try node.appendText(a, &text);
         const ss = try css.parse(a, text.items);
@@ -80,7 +65,7 @@ fn collectStyleElements(a: std.mem.Allocator, node: *dom.Node, rules: *std.Array
             try rules.append(a, .{ .origin = .author, .order = order.*, .rule = r });
             order.* += 1;
         }
-        return; // don't descend into style contents
+        return;
     }
     var child = node.first_child;
     while (child) |c| : (child = c.next_sibling) try collectStyleElements(a, c, rules, order);
@@ -90,7 +75,6 @@ const Styler = struct {
     a: std.mem.Allocator,
     rules: []const TaggedRule,
 
-    /// Recursively compute styles top-down so inheritance flows from parents.
     fn styleNode(self: Styler, node: *dom.Node, parent: ComputedStyle) !void {
         const cs = try self.a.create(ComputedStyle);
         cs.* = ComputedStyle.inheritFrom(parent);
@@ -104,13 +88,12 @@ const Styler = struct {
         while (child) |c| : (child = c.next_sibling) try self.styleNode(c, cs.*);
     }
 
-    /// Gather all matching declarations for `node`, sort by cascade order, apply.
     fn cascadeInto(self: Styler, cs: *ComputedStyle, node: *dom.Node) !void {
         var cands: std.ArrayList(Candidate) = .empty;
         defer cands.deinit(self.a);
 
         for (self.rules) |tr| {
-            var best: ?u32 = null; // best specificity among this rule's matching selectors
+            var best: ?u32 = null;
             for (tr.rule.selectors) |sel| {
                 if (matches(sel, node)) {
                     const sp = sel.specificity();
@@ -125,7 +108,6 @@ const Styler = struct {
             });
         }
 
-        // inline style="" attribute — highest origin
         if (node.attr("style")) |inline_css| {
             const ss = try css.parse(self.a, try std.fmt.allocPrint(self.a, "*{{{s}}}", .{inline_css}));
             if (ss.rules.len > 0) try cands.append(self.a, .{
@@ -142,8 +124,6 @@ const Styler = struct {
         }
     }
 };
-
-// --- selector matching ---
 
 fn matches(sel: css.Selector, el: *dom.Node) bool {
     return matchFrom(sel, sel.compounds.len - 1, el);
@@ -202,8 +182,6 @@ fn hasClass(class_attr: []const u8, want: []const u8) bool {
     return false;
 }
 
-// --- property application ---
-
 fn applyDecl(cs: *ComputedStyle, d: css.Declaration) void {
     const v = d.value;
     if (eq(d.name, "display")) {
@@ -221,7 +199,6 @@ fn applyDecl(cs: *ComputedStyle, d: css.Declaration) void {
     } else if (eq(d.name, "color")) {
         if (parseColor(v)) |col| cs.color = col;
     } else if (eq(d.name, "margin")) {
-        // shorthand: first token applies to top+bottom (our line-based model)
         if (firstLineCount(v)) |n| {
             cs.margin_top = n;
             cs.margin_bottom = n;
@@ -233,9 +210,6 @@ fn applyDecl(cs: *ComputedStyle, d: css.Declaration) void {
     }
 }
 
-/// We model vertical margins in whole terminal lines. The UA sheet uses bare
-/// integers ("1"); author values in px/em we can't map to cells yet, so they're
-/// ignored (treated as 0) until real length handling lands.
 fn firstLineCount(v: []const u8) ?u8 {
     var it = std.mem.tokenizeAny(u8, v, " \t");
     const first = it.next() orelse return null;
@@ -282,8 +256,6 @@ fn hexNibble(c: u8) ?u8 {
     return std.fmt.charToDigit(c, 16) catch null;
 }
 
-// --- tests ---
-
 const testing = std.testing;
 const html = @import("../html/parser.zig");
 
@@ -303,7 +275,7 @@ test "UA stylesheet sets block/none/bold defaults" {
     try testing.expectEqual(style.Display.block, p.computed.?.display);
     try testing.expectEqual(style.Display.none, head.computed.?.display);
 
-    const b = p.first_child.?.next_sibling.?; // text "hi ", then <b>
+    const b = p.first_child.?.next_sibling.?;
     try testing.expectEqualStrings("b", b.tag);
     try testing.expectEqual(style.FontWeight.bold, b.computed.?.font_weight);
 }
@@ -321,14 +293,12 @@ test "author style overrides UA, specificity + inline win" {
     try styleDoc(&doc);
 
     const body = doc.root.first_child.?.first_child.?.next_sibling.?;
-    // first element child of body is the <p>
     var p = body.first_child;
     while (p) |n| : (p = n.next_sibling) {
         if (n.kind == .element and std.mem.eql(u8, n.tag, "p")) break;
     }
     const pn = p.?;
-    try testing.expectEqual(style.Display.inline_, pn.computed.?.display); // from UA-overriding author
-    // inline style wins over both author rules
+    try testing.expectEqual(style.Display.inline_, pn.computed.?.display);
     try testing.expectEqual(style.Color{ .rgb = .{ .r = 0, .g = 0, .b = 255 } }, pn.computed.?.color);
 }
 
@@ -344,6 +314,6 @@ test "inherited color flows to descendants, display does not" {
     const span = div.first_child.?;
     const green = style.Color{ .rgb = .{ .r = 0, .g = 255, .b = 0 } };
     try testing.expectEqual(green, div.computed.?.color);
-    try testing.expectEqual(green, span.computed.?.color); // inherited
-    try testing.expectEqual(style.Display.inline_, span.computed.?.display); // not inherited
+    try testing.expectEqual(green, span.computed.?.color);
+    try testing.expectEqual(style.Display.inline_, span.computed.?.display);
 }

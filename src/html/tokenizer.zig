@@ -1,21 +1,16 @@
-//! HTML tokenizer — pragmatic subset of the WHATWG tokenizer.
-//! Emits start/end tags (with attributes), text, comments, doctype.
-//! Raw-text elements (script/style/title/textarea) consume to their close tag.
-//! Not full-spec (no error-recovery state machine yet) but handles real pages.
-
 const std = @import("std");
 
 pub const Attr = struct { name: []const u8, value: []const u8 };
 
 pub const Token = union(enum) {
-    text: []const u8, // raw slice into source; entities decoded by caller
+    text: []const u8,
     start_tag: StartTag,
-    end_tag: []const u8, // lowercased name
+    end_tag: []const u8,
     comment: []const u8,
     doctype,
 
     pub const StartTag = struct {
-        name: []const u8, // lowercased
+        name: []const u8,
         attrs: []Attr,
         self_closing: bool,
     };
@@ -34,13 +29,11 @@ pub const Tokenizer = struct {
         if (self.pos >= self.src.len) return null;
 
         if (self.src[self.pos] == '<') {
-            // markup, unless it's a stray '<' not starting a valid construct
             if (self.peekAt(1)) |c1| {
                 if (c1 == '!') return try self.markupDeclaration();
                 if (c1 == '/') return try self.endTag();
                 if (std.ascii.isAlphabetic(c1)) return try self.startTag();
             }
-            // stray '<' — treat as text
             return self.textRun();
         }
         return self.textRun();
@@ -51,17 +44,14 @@ pub const Tokenizer = struct {
         return if (i < self.src.len) self.src[i] else null;
     }
 
-    /// Consume text up to the next '<'.
     fn textRun(self: *Tokenizer) Token {
         const start = self.pos;
-        // ensure progress on a stray '<'
         if (self.src[self.pos] == '<') self.pos += 1;
         while (self.pos < self.src.len and self.src[self.pos] != '<') self.pos += 1;
         return .{ .text = self.src[start..self.pos] };
     }
 
     fn markupDeclaration(self: *Tokenizer) !Token {
-        // self.pos at '<', next is '!'
         if (self.startsWithAt(self.pos + 2, "--")) {
             const start = self.pos + 4;
             const close = std.mem.indexOfPos(u8, self.src, start, "-->") orelse self.src.len;
@@ -69,20 +59,19 @@ pub const Tokenizer = struct {
             self.pos = if (close < self.src.len) close + 3 else self.src.len;
             return .{ .comment = body };
         }
-        // doctype or other declaration — skip to '>'
         self.skipTo('>');
         return .doctype;
     }
 
     fn endTag(self: *Tokenizer) !Token {
-        self.pos += 2; // skip "</"
+        self.pos += 2;
         const name = self.readName();
         self.skipTo('>');
         return .{ .end_tag = name };
     }
 
     fn startTag(self: *Tokenizer) !Token {
-        self.pos += 1; // skip '<'
+        self.pos += 1;
         const name = self.readName();
 
         var attrs: std.ArrayList(Attr) = .empty;
@@ -100,12 +89,11 @@ pub const Tokenizer = struct {
                 self.pos += 1;
                 continue;
             }
-            // attribute name
             const an_start = self.pos;
             while (self.pos < self.src.len and !isAttrNameEnd(self.src[self.pos])) self.pos += 1;
             const aname = self.src[an_start..self.pos];
             if (aname.len == 0) {
-                self.pos += 1; // skip junk, avoid stall
+                self.pos += 1;
                 continue;
             }
             var avalue: []const u8 = "";
@@ -119,15 +107,9 @@ pub const Tokenizer = struct {
         }
 
         const lname = lower(self.alloc, name);
-        // Raw-text elements (script/style/title/textarea) are handled by the
-        // parser: after accepting this start tag it calls rawTextUntil(name) so
-        // bodies containing '<' stay intact.
         return .{ .start_tag = .{ .name = lname, .attrs = try attrs.toOwnedSlice(self.alloc), .self_closing = self_closing } };
     }
 
-    /// Called by the parser right after it accepts a raw-text start tag
-    /// (script/style/title/textarea). Returns the raw content up to (but not
-    /// consuming) the matching close tag, advancing pos to the '<' of </name>.
     pub fn rawTextUntil(self: *Tokenizer, name: []const u8) []const u8 {
         const start = self.pos;
         var i = self.pos;
@@ -147,8 +129,6 @@ pub const Tokenizer = struct {
         return self.src[start..];
     }
 
-    // --- small helpers ---
-
     fn readName(self: *Tokenizer) []const u8 {
         const start = self.pos;
         while (self.pos < self.src.len and isNameChar(self.src[self.pos])) self.pos += 1;
@@ -163,7 +143,7 @@ pub const Tokenizer = struct {
             const start = self.pos;
             while (self.pos < self.src.len and self.src[self.pos] != q) self.pos += 1;
             const v = self.src[start..self.pos];
-            if (self.pos < self.src.len) self.pos += 1; // closing quote
+            if (self.pos < self.src.len) self.pos += 1;
             return v;
         }
         const start = self.pos;
@@ -177,7 +157,7 @@ pub const Tokenizer = struct {
 
     fn skipTo(self: *Tokenizer, ch: u8) void {
         while (self.pos < self.src.len and self.src[self.pos] != ch) self.pos += 1;
-        if (self.pos < self.src.len) self.pos += 1; // consume it
+        if (self.pos < self.src.len) self.pos += 1;
     }
 
     fn startsWithAt(self: *Tokenizer, i: usize, s: []const u8) bool {

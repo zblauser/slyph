@@ -1,29 +1,17 @@
-//! CSS parser — pragmatic subset of the CSS syntax.
-//! Parses a stylesheet into rules: each rule is a list of selectors + a list of
-//! declarations. Selectors support tag / .class / #id / * and descendant
-//! combinators, grouped by commas. At-rules (@media, @font-face, …) are skipped
-//! wholesale for now. Good enough to drive the cascade on real pages.
-
 const std = @import("std");
 
 pub const Combinator = enum { descendant, child };
 
-/// One compound selector: an optional tag plus any number of classes/ids.
-/// `tag == "*"` or "" means universal (matches any element).
 pub const Compound = struct {
-    tag: []const u8 = "", // "" or "*" => universal
+    tag: []const u8 = "",
     id: []const u8 = "",
     classes: []const []const u8 = &.{},
-    /// How this compound joins to the *previous* one in the chain.
     combinator: Combinator = .descendant,
 };
 
-/// A full selector: a chain of compounds read left→right (ancestor→target).
-/// The last compound is the subject (the element the rule applies to).
 pub const Selector = struct {
     compounds: []Compound,
 
-    /// CSS specificity packed as a sortable integer: (#id, .class, tag).
     pub fn specificity(self: Selector) u32 {
         var ids: u32 = 0;
         var classes: u32 = 0;
@@ -41,8 +29,8 @@ pub const Selector = struct {
 };
 
 pub const Declaration = struct {
-    name: []const u8, // lowercased property name
-    value: []const u8, // trimmed raw value
+    name: []const u8,
+    value: []const u8,
 };
 
 pub const Rule = struct {
@@ -54,8 +42,6 @@ pub const Stylesheet = struct {
     rules: []Rule,
 };
 
-/// Parse CSS text into a Stylesheet. All output is allocated from `a`
-/// (typically the document arena). Malformed input is skipped, not fatal.
 pub fn parse(a: std.mem.Allocator, src: []const u8) !Stylesheet {
     var p = Parser{ .a = a, .src = src };
     var rules: std.ArrayList(Rule) = .empty;
@@ -76,18 +62,16 @@ const Parser = struct {
     src: []const u8,
     pos: usize = 0,
 
-    /// Parse one rule: `selectors { declarations }`. Returns null if no '{'
-    /// follows (malformed tail).
     fn rule(self: *Parser) !?Rule {
         const sel_start = self.pos;
         while (self.pos < self.src.len and self.src[self.pos] != '{') {
-            if (self.src[self.pos] == '}') return null; // stray
+            if (self.src[self.pos] == '}') return null;
             self.advancePastComments();
             if (self.pos < self.src.len and self.src[self.pos] != '{') self.pos += 1;
         }
         if (self.pos >= self.src.len) return null;
         const sel_text = self.src[sel_start..self.pos];
-        self.pos += 1; // consume '{'
+        self.pos += 1;
 
         const decls = try self.declarations();
         const selectors = try self.selectorList(sel_text);
@@ -95,7 +79,6 @@ const Parser = struct {
         return .{ .selectors = selectors, .decls = decls };
     }
 
-    /// Parse declarations up to and including the closing '}'.
     fn declarations(self: *Parser) ![]Declaration {
         var out: std.ArrayList(Declaration) = .empty;
         while (self.pos < self.src.len and self.src[self.pos] != '}') {
@@ -105,14 +88,13 @@ const Parser = struct {
             while (self.pos < self.src.len and self.src[self.pos] != ':' and
                 self.src[self.pos] != ';' and self.src[self.pos] != '}') self.pos += 1;
             if (self.pos >= self.src.len or self.src[self.pos] != ':') {
-                // no colon — skip to ';' or '}'
                 while (self.pos < self.src.len and self.src[self.pos] != ';' and
                     self.src[self.pos] != '}') self.pos += 1;
                 if (self.pos < self.src.len and self.src[self.pos] == ';') self.pos += 1;
                 continue;
             }
             const name = std.mem.trim(u8, self.src[name_start..self.pos], " \t\r\n");
-            self.pos += 1; // consume ':'
+            self.pos += 1;
             const val_start = self.pos;
             while (self.pos < self.src.len and self.src[self.pos] != ';' and
                 self.src[self.pos] != '}') self.pos += 1;
@@ -135,13 +117,11 @@ const Parser = struct {
         return out.toOwnedSlice(self.a);
     }
 
-    /// Parse a single selector (already comma-split) into a compound chain.
     fn selector(self: *Parser, text: []const u8) !?Selector {
         var compounds: std.ArrayList(Compound) = .empty;
         var i: usize = 0;
         var next_combinator: Combinator = .descendant;
         while (i < text.len) {
-            // skip whitespace (= descendant unless an explicit combinator follows)
             while (i < text.len and isWs(text[i])) i += 1;
             if (i >= text.len) break;
             if (text[i] == '>') {
@@ -161,12 +141,10 @@ const Parser = struct {
         return .{ .compounds = try compounds.toOwnedSlice(self.a) };
     }
 
-    /// Parse one compound token like `div.foo.bar#id` or `.cls` or `*`.
     fn compound(self: *Parser, tok: []const u8, comb: Combinator) !Compound {
         var c = Compound{ .combinator = comb };
         var classes: std.ArrayList([]const u8) = .empty;
         var i: usize = 0;
-        // leading type/universal selector (no . or # prefix)
         if (tok[0] != '.' and tok[0] != '#') {
             const start = i;
             while (i < tok.len and tok[i] != '.' and tok[i] != '#') i += 1;
@@ -189,8 +167,6 @@ const Parser = struct {
         return c;
     }
 
-    // --- trivia ---
-
     fn skipTrivia(self: *Parser) void {
         while (self.pos < self.src.len) {
             if (isWs(self.src[self.pos])) {
@@ -211,7 +187,6 @@ const Parser = struct {
         self.pos = if (end < self.src.len) end + 2 else self.src.len;
     }
 
-    /// Skip an at-rule: either `@foo ... ;` or `@foo ... { ... }` (balanced).
     fn skipAtRule(self: *Parser) void {
         while (self.pos < self.src.len and self.src[self.pos] != ';' and self.src[self.pos] != '{') self.pos += 1;
         if (self.pos >= self.src.len) return;
@@ -219,7 +194,6 @@ const Parser = struct {
             self.pos += 1;
             return;
         }
-        // balanced-brace skip
         var depth: usize = 0;
         while (self.pos < self.src.len) {
             const ch = self.src[self.pos];
@@ -271,21 +245,18 @@ test "selector groups, classes, ids, descendant + specificity" {
     const r = ss.rules[0];
     try std.testing.expectEqual(@as(usize, 2), r.selectors.len);
 
-    // a.x  => 1 compound, tag a, class x
     const s0 = r.selectors[0];
     try std.testing.expectEqual(@as(usize, 1), s0.compounds.len);
     try std.testing.expectEqualStrings("a", s0.compounds[0].tag);
     try std.testing.expectEqualStrings("x", s0.compounds[0].classes[0]);
     try std.testing.expectEqual(@as(u32, (0 << 16) | (1 << 8) | 1), s0.specificity());
 
-    // div#main p.y.z => 2 compounds
     const s1 = r.selectors[1];
     try std.testing.expectEqual(@as(usize, 2), s1.compounds.len);
     try std.testing.expectEqualStrings("div", s1.compounds[0].tag);
     try std.testing.expectEqualStrings("main", s1.compounds[0].id);
     try std.testing.expectEqualStrings("p", s1.compounds[1].tag);
     try std.testing.expectEqual(@as(usize, 2), s1.compounds[1].classes.len);
-    // 1 id, 2 classes, 2 tags
     try std.testing.expectEqual(@as(u32, (1 << 16) | (2 << 8) | 2), s1.specificity());
 }
 

@@ -1,7 +1,7 @@
 .{
-    .name = .webcli,
-    .version = "0.0.0",
-    .fingerprint = 0xd0afd34157187861,
+    .name = .slyph,
+    .version = "0.1.0",
+    .fingerprint = 0x3ed6e6faf1c338da,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

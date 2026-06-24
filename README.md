@@ -7,7 +7,7 @@ no chromium, no webkit, no servo.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.1-000?style=flat-square&labelColor=500" alt="version"/>
+  <img src="https://img.shields.io/badge/version-v0.1.1-000?style=flat-square&labelColor=500" alt="version"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-000?style=flat-square&labelColor=500" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/zig-0.16-000?style=flat-square&labelColor=500" alt="zig 0.16"/>
 </p>
@@ -27,7 +27,12 @@ slyph inverts that. it parses and runs everything itself, **every stage is a poi
 > - scroll, links, forms, login. no javascript yet. expect rough edges.
 
 ## version
-<b>v0.1 (latest)</b>
+<b>v0.1.1 (latest)</b>
++ reload + back/forward history, with an in-app error page when a fetch fails
++ full keyboard scroll: arrows, page up/down, home/end
++ status bar shows the current url + scroll position
+
+<b>v0.1</b>
 + pure-zig text browser end to end, zero C
 + html5 tokenizer + tree builder → dom
 + css parser + cascade + computed style (specificity, inherit)
@@ -59,14 +64,16 @@ slyph example.com | less   # piped → plain-text dump
 
 | key            | action                        |
 | -------------- | ----------------------------- |
-| `j` / `k`      | scroll line down / up         |
+| `j` / `k` / arrows | scroll line down / up     |
 | `d` / `u`      | half-page down / up           |
 | `space` / `b`  | half-page down / up           |
-| `g` / `G`      | top / bottom                  |
+| `PgUp` / `PgDn`| page up / down                |
+| `g` / `G` / `Home` / `End` | top / bottom      |
 | `f`            | follow a `[n]` link           |
 | `i`            | edit / activate a `{n}` field |
+| `r`            | reload                        |
 | `Ctrl+L` / `:` | open the url bar              |
-| `H`            | back                          |
+| `H` / `L`      | back / forward                |
 | `q`            | quit                          |
 </details>
 

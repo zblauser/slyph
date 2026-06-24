@@ -6,6 +6,8 @@ const forms = @import("../forms/forms.zig");
 pub const Action = union(enum) {
     quit,
     back,
+    forward,
+    reload,
     follow: []const u8,
     navigate: []const u8,
     edit: struct { field: usize, value: []const u8 },
@@ -47,12 +49,33 @@ pub fn view(
         switch (readByte() orelse break) {
             'q' => return .quit,
             'H' => return .back,
+            'L' => return .forward,
+            'r' => return .reload,
             'j' => scroll.* = @min(scroll.* + 1, max_scroll),
             'k' => scroll.* -|= 1,
             'd', ' ' => scroll.* = @min(scroll.* + page / 2, max_scroll),
             'u', 'b' => scroll.* -|= page / 2,
             'g' => scroll.* = 0,
             'G' => scroll.* = max_scroll,
+            0x1b => {
+                const intro = readByte() orelse break;
+                if (intro != '[' and intro != 'O') continue;
+                switch (readByte() orelse break) {
+                    'A' => scroll.* -|= 1,
+                    'B' => scroll.* = @min(scroll.* + 1, max_scroll),
+                    'H' => scroll.* = 0,
+                    'F' => scroll.* = max_scroll,
+                    '5' => {
+                        _ = readByte();
+                        scroll.* -|= page;
+                    },
+                    '6' => {
+                        _ = readByte();
+                        scroll.* = @min(scroll.* + page, max_scroll);
+                    },
+                    else => {},
+                }
+            },
             'f' => {
                 if (try promptIndex(gpa, io, out, &buf, cols, rows, "follow link", links.len)) |n|
                     return .{ .follow = links[n - 1] };
@@ -101,19 +124,33 @@ fn draw(
         if (r < lines.len) try buf.appendSlice(gpa, lines[r]);
         try buf.appendSlice(gpa, "\x1b[K\r\n");
     }
-    try statusBar(gpa, buf, bar, cols);
+    const pos = position(scroll, lines.len, page);
+    try statusBar(gpa, buf, bar, &pos, cols);
     try out.writeStreamingAll(io, buf.items);
 }
 
-fn statusBar(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8, cols: u16) !void {
+fn position(scroll: usize, total: usize, page: u16) [6]u8 {
+    if (total <= page) return "  ALL ".*;
+    const max = total - page;
+    if (scroll == 0) return "  TOP ".*;
+    if (scroll >= max) return "  BOT ".*;
+    var out: [6]u8 = "  ??  ".*;
+    _ = std.fmt.bufPrint(&out, " {d:>3}% ", .{scroll * 100 / max}) catch {};
+    return out;
+}
+
+fn statusBar(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8, right: []const u8, cols: u16) !void {
     try buf.appendSlice(gpa, "\x1b[7m");
+    const right_w: u16 = @min(@as(u16, @intCast(right.len)), cols);
+    const left_max = cols - right_w;
     var w: u16 = 0;
     for (text) |c| {
-        if (w >= cols) break;
+        if (w >= left_max) break;
         try buf.append(gpa, c);
         w += 1;
     }
-    while (w < cols) : (w += 1) try buf.append(gpa, ' ');
+    while (w < left_max) : (w += 1) try buf.append(gpa, ' ');
+    try buf.appendSlice(gpa, right[0..right_w]);
     try buf.appendSlice(gpa, "\x1b[0m");
 }
 
@@ -138,7 +175,7 @@ fn promptText(gpa: std.mem.Allocator, io: std.Io, out: std.Io.File, buf: *std.Ar
         try prompt.appendSlice(gpa, label);
         try prompt.appendSlice(gpa, ": ");
         try prompt.appendSlice(gpa, text.items);
-        try statusBar(gpa, buf, prompt.items, cols);
+        try statusBar(gpa, buf, prompt.items, "", cols);
         try out.writeStreamingAll(io, buf.items);
 
         switch (readByte() orelse return null) {

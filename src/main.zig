@@ -63,6 +63,8 @@ fn run(init: std.process.Init) !void {
 
     var history: std.ArrayList(Nav) = .empty;
     defer history.deinit(gpa);
+    var fwd: std.ArrayList(Nav) = .empty;
+    defer fwd.deinit(gpa);
     var nav: Nav = .{ .url = current };
 
     var redirects: u8 = 0;
@@ -72,8 +74,7 @@ fn run(init: std.process.Init) !void {
         var status: u16 = 200;
         if (std.mem.eql(u8, nav.url, start_url)) {
             try buildStartHtml(arena, bookmarks, &body.writer);
-        } else {
-            const res = fetch(io, &client, &jar, arena, nav, &body, now) catch return;
+        } else if (fetch(io, &client, &jar, arena, nav, &body, now)) |res| {
             if (res.status >= 300 and res.status < 400) {
                 if (res.location) |loc| {
                     if (redirects >= 10) {
@@ -87,6 +88,11 @@ fn run(init: std.process.Init) !void {
             }
             redirects = 0;
             status = res.status;
+        } else |err| {
+            if (!term.tty) return;
+            redirects = 0;
+            status = 0;
+            try buildErrorHtml(nav.url, err, &body.writer);
         }
 
         var doc = try html.parse(gpa, body.writer.buffered());
@@ -109,17 +115,25 @@ fn run(init: std.process.Init) !void {
             const sa = scratch.allocator();
             const pg = try layout.layout(sa, &doc, term.cols);
             const frame = try render.render(sa, pg.root, true);
-            var b: [256]u8 = undefined;
-            const bar = std.fmt.bufPrint(&b, " slyph [{d}] {s}  ({d} links, {d} fields)  f follow · i field · ^L url · H back · q quit", .{ status, doc.title, pg.links.len, pg.fields.len }) catch " slyph";
+            var b: [512]u8 = undefined;
+            const bar = std.fmt.bufPrint(&b, " slyph  {s}  [{d}] {s}  ({d}L {d}F)  f·i·r·^L·H·L·q", .{ nav.url, status, doc.title, pg.links.len, pg.fields.len }) catch " slyph";
 
             switch (try viewer.view(gpa, io, frame, pg.links, pg.fields, term.cols, term.rows, bar, &scroll)) {
                 .quit => return,
                 .back => if (history.pop()) |prev| {
+                    try fwd.append(gpa, nav);
                     nav = prev;
                     continue :page_loop;
                 },
+                .forward => if (fwd.pop()) |next| {
+                    try history.append(gpa, nav);
+                    nav = next;
+                    continue :page_loop;
+                },
+                .reload => continue :page_loop,
                 .follow => |href| {
                     try history.append(gpa, nav);
+                    fwd.clearRetainingCapacity();
                     nav = .{ .url = try resolveUrl(arena, nav.url, href) };
                     continue :page_loop;
                 },
@@ -127,6 +141,7 @@ fn run(init: std.process.Init) !void {
                     const url = try absoluteUrl(arena, typed);
                     gpa.free(typed);
                     try history.append(gpa, nav);
+                    fwd.clearRetainingCapacity();
                     nav = .{ .url = url };
                     continue :page_loop;
                 },
@@ -140,6 +155,7 @@ fn run(init: std.process.Init) !void {
                 },
                 .submit => |fi| {
                     try history.append(gpa, nav);
+                    fwd.clearRetainingCapacity();
                     nav = try buildSubmit(arena, nav.url, pg.fields[fi].node);
                     continue :page_loop;
                 },
@@ -351,7 +367,7 @@ const start_html_head =
 ;
 const start_html_foot =
     \\<pre class=rule>════════════════════════════</pre>
-    \\<pre class=hint>^L url · f follow · q quit</pre>
+    \\<pre class=hint>^L url · f follow · r reload · H back · L fwd · q quit</pre>
 ;
 
 fn loadStart(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, dir: []const u8, file: []const u8) ![]const Bookmark {
@@ -392,7 +408,23 @@ fn buildStartHtml(arena: std.mem.Allocator, bookmarks: []const Bookmark, w: *std
     try w.writeAll(start_html_foot);
 }
 
+fn buildErrorHtml(url: []const u8, err: anyerror, w: *std.Io.Writer) !void {
+    const note: []const u8 = if (err == error.TlsInitializationFailed)
+        "TLS handshake unsupported for this site (known std.crypto.tls gap)."
+    else
+        "";
+    try w.print(
+        \\<style> .err {{ color:#ff8787 }} .k {{ color:#6a6a6a }} </style>
+        \\<pre class=err>could not load</pre>
+        \\<pre>{s}</pre>
+        \\<pre>{t}</pre>
+        \\<pre>{s}</pre>
+        \\<pre class=k>H back · L forward · ^L url · r retry · q quit</pre>
+    , .{ url, err, note });
+}
+
 fn absoluteUrl(arena: std.mem.Allocator, typed: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, typed, "about:")) return arena.dupe(u8, typed);
     if (std.mem.indexOf(u8, typed, "://") == null)
         return std.fmt.allocPrint(arena, "https://{s}", .{typed});
     return arena.dupe(u8, typed);
@@ -430,7 +462,7 @@ fn eqlAny(s: []const u8, opts: []const []const u8) bool {
     return false;
 }
 
-const version = "0.1.0";
+const version = "0.1.1";
 
 const help_text =
     \\slyph — terminal web browser (pure zig, own engine)
@@ -441,9 +473,9 @@ const help_text =
     \\  slyph <url> | less   pipe for a plain-text dump
     \\
     \\keys:
-    \\  j/k scroll   d/u half-page   g/G top/bottom
-    \\  f follow link    i edit/activate field
-    \\  ^L or :  url bar     H back     q quit
+    \\  j/k or arrows scroll   d/u half-page   PgUp/PgDn page   g/G top/bottom
+    \\  f follow link    i edit/activate field    r reload
+    \\  ^L or :  url bar     H back     L forward     q quit
     \\
     \\config in ~/.slyph/ : start, cookies.txt, cookies.policy
     \\

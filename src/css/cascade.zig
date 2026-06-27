@@ -2,6 +2,7 @@ const std = @import("std");
 const dom = @import("../dom/node.zig");
 const style = @import("style.zig");
 const css = @import("parser.zig");
+const DenyList = @import("../policy.zig").DenyList;
 
 const ComputedStyle = style.ComputedStyle;
 
@@ -40,7 +41,7 @@ const Candidate = struct {
     }
 };
 
-pub fn apply(a: std.mem.Allocator, doc: *dom.Document) !void {
+pub fn apply(a: std.mem.Allocator, doc: *dom.Document, host: []const u8, css_policy: ?*const DenyList, extra_sheets: []const []const u8) !void {
     var rules: std.ArrayList(TaggedRule) = .empty;
     defer rules.deinit(a);
     var order: u32 = 0;
@@ -50,9 +51,16 @@ pub fn apply(a: std.mem.Allocator, doc: *dom.Document) !void {
         try rules.append(a, .{ .origin = .ua, .order = order, .rule = r });
         order += 1;
     }
+    for (extra_sheets) |sheet| {
+        const ss = try css.parse(a, sheet);
+        for (ss.rules) |r| {
+            try rules.append(a, .{ .origin = .author, .order = order, .rule = r });
+            order += 1;
+        }
+    }
     try collectStyleElements(a, doc.root, &rules, &order);
 
-    const styler = Styler{ .a = a, .rules = rules.items };
+    const styler = Styler{ .a = a, .rules = rules.items, .host = host, .policy = css_policy };
     try styler.styleNode(doc.root, ComputedStyle.initial);
 }
 
@@ -74,6 +82,8 @@ fn collectStyleElements(a: std.mem.Allocator, node: *dom.Node, rules: *std.Array
 const Styler = struct {
     a: std.mem.Allocator,
     rules: []const TaggedRule,
+    host: []const u8,
+    policy: ?*const DenyList,
 
     fn styleNode(self: Styler, node: *dom.Node, parent: ComputedStyle) !void {
         const cs = try self.a.create(ComputedStyle);
@@ -119,9 +129,33 @@ const Styler = struct {
         }
 
         std.mem.sort(Candidate, cands.items, {}, Candidate.lessThan);
+
+        var locals: std.ArrayList(style.Var) = .empty;
         for (cands.items) |c| {
-            for (c.decls) |d| applyDecl(cs, d);
+            for (c.decls) |d| {
+                if (!std.mem.startsWith(u8, d.name, "--")) continue;
+                if (c.origin != .ua and self.denies(d.name)) continue;
+                try locals.append(self.a, .{ .name = d.name, .value = d.value });
+            }
         }
+        if (locals.items.len > 0) {
+            try locals.appendSlice(self.a, cs.vars);
+            cs.vars = try locals.toOwnedSlice(self.a);
+        }
+
+        for (cands.items) |c| {
+            for (c.decls) |d| {
+                if (std.mem.startsWith(u8, d.name, "--")) continue;
+                if (c.origin != .ua and self.denies(d.name)) continue;
+                const value = try resolveVars(self.a, d.value, cs.vars);
+                applyDecl(cs, .{ .name = d.name, .value = value });
+            }
+        }
+    }
+
+    fn denies(self: Styler, prop: []const u8) bool {
+        const p = self.policy orelse return false;
+        return p.denied(self.host, prop);
     }
 };
 
@@ -159,7 +193,9 @@ fn elementParent(el: *dom.Node) ?*dom.Node {
 fn compoundMatches(c: css.Compound, el: *dom.Node) bool {
     if (el.kind != .element) return false;
     if (c.tag.len > 0 and !std.mem.eql(u8, c.tag, "*")) {
-        if (!std.mem.eql(u8, c.tag, el.tag)) return false;
+        if (std.mem.eql(u8, c.tag, ":root")) {
+            if (!std.mem.eql(u8, el.tag, "html")) return false;
+        } else if (!std.mem.eql(u8, c.tag, el.tag)) return false;
     }
     if (c.id.len > 0) {
         const id = el.attr("id") orelse return false;
@@ -180,6 +216,36 @@ fn hasClass(class_attr: []const u8, want: []const u8) bool {
         if (std.mem.eql(u8, cls, want)) return true;
     }
     return false;
+}
+
+fn resolveVars(a: std.mem.Allocator, value: []const u8, vars: []const style.Var) ![]const u8 {
+    if (std.mem.indexOf(u8, value, "var(") == null) return value;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < value.len) {
+        if (std.mem.startsWith(u8, value[i..], "var(")) {
+            const rel = std.mem.indexOfScalar(u8, value[i + 4 ..], ')') orelse {
+                try out.appendSlice(a, value[i..]);
+                break;
+            };
+            const close = i + 4 + rel;
+            const inner = value[i + 4 .. close];
+            const comma = std.mem.indexOfScalar(u8, inner, ',');
+            const name = std.mem.trim(u8, if (comma) |k| inner[0..k] else inner, " \t");
+            const fallback = if (comma) |k| std.mem.trim(u8, inner[k + 1 ..], " \t") else "";
+            try out.appendSlice(a, lookupVar(vars, name) orelse fallback);
+            i = close + 1;
+        } else {
+            try out.append(a, value[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn lookupVar(vars: []const style.Var, name: []const u8) ?[]const u8 {
+    for (vars) |v| if (std.ascii.eqlIgnoreCase(v.name, name)) return v.value;
+    return null;
 }
 
 fn applyDecl(cs: *ComputedStyle, d: css.Declaration) void {
@@ -260,7 +326,7 @@ const testing = std.testing;
 const html = @import("../html/parser.zig");
 
 fn styleDoc(doc: *dom.Document) !void {
-    try apply(doc.alloc(), doc);
+    try apply(doc.alloc(), doc, "", null, &.{});
 }
 
 test "UA stylesheet sets block/none/bold defaults" {
@@ -300,6 +366,99 @@ test "author style overrides UA, specificity + inline win" {
     const pn = p.?;
     try testing.expectEqual(style.Display.inline_, pn.computed.?.display);
     try testing.expectEqual(style.Color{ .rgb = .{ .r = 0, .g = 0, .b = 255 } }, pn.computed.?.color);
+}
+
+test "css policy strips denied author property, leaves UA + other props" {
+    var doc = try html.parse(testing.allocator,
+        \\<html><head><style>
+        \\  p { color: red; font-weight: bold }
+        \\</style></head><body><p style="color: blue"><b>x</b></p></body></html>
+    );
+    defer doc.deinit();
+
+    var p: DenyList = .init(testing.allocator);
+    defer p.deinit();
+    try p.loadDenyLines("deny ban.example color\n");
+    try apply(doc.alloc(), &doc, "ban.example", &p, &.{});
+
+    const body = doc.root.first_child.?.first_child.?.next_sibling.?;
+    var pn = body.first_child;
+    while (pn) |n| : (pn = n.next_sibling) {
+        if (n.kind == .element and std.mem.eql(u8, n.tag, "p")) break;
+    }
+    const para = pn.?;
+    try testing.expectEqual(style.Color.default, para.computed.?.color);
+    try testing.expectEqual(style.FontWeight.bold, para.computed.?.font_weight);
+    const b = para.first_child.?;
+    try testing.expectEqualStrings("b", b.tag);
+    try testing.expectEqual(style.FontWeight.bold, b.computed.?.font_weight);
+}
+
+test "custom properties on :root resolve via var() on descendants" {
+    var doc = try html.parse(testing.allocator,
+        \\<html><head><style>
+        \\  :root { --gold: #b89656; --bone: #c8c2b2 }
+        \\  body { color: var(--bone) }
+        \\  a { color: var(--gold) }
+        \\</style></head><body><a href=x>link</a></body></html>
+    );
+    defer doc.deinit();
+    try styleDoc(&doc);
+
+    const htmlnode = doc.root.first_child.?;
+    const body = htmlnode.first_child.?.next_sibling.?;
+    try testing.expectEqual(style.Color{ .rgb = .{ .r = 0xc8, .g = 0xc2, .b = 0xb2 } }, body.computed.?.color);
+    const a = body.first_child.?;
+    try testing.expectEqualStrings("a", a.tag);
+    try testing.expectEqual(style.Color{ .rgb = .{ .r = 0xb8, .g = 0x96, .b = 0x56 } }, a.computed.?.color);
+}
+
+test "var() falls back when custom property is undefined" {
+    var doc = try html.parse(testing.allocator,
+        \\<html><body><p style="color: var(--nope, #ff0000)">x</p></body></html>
+    );
+    defer doc.deinit();
+    try styleDoc(&doc);
+    const para = doc.root.first_child.?.first_child.?.first_child.?;
+    try testing.expectEqual(style.Color{ .rgb = .{ .r = 255, .g = 0, .b = 0 } }, para.computed.?.color);
+}
+
+test "external (linked) stylesheet applies as author css" {
+    var doc = try html.parse(testing.allocator, "<html><body><p class=hi>x</p></body></html>");
+    defer doc.deinit();
+    const sheets = [_][]const u8{"p.hi { color: #00ff00 }"};
+    try apply(doc.alloc(), &doc, "x.com", null, &sheets);
+
+    const para = doc.root.first_child.?.first_child.?.first_child.?;
+    try testing.expectEqualStrings("p", para.tag);
+    try testing.expectEqual(style.Color{ .rgb = .{ .r = 0, .g = 255, .b = 0 } }, para.computed.?.color);
+}
+
+test "css policy also strips a denied property from a linked sheet" {
+    var doc = try html.parse(testing.allocator, "<html><body><p>x</p></body></html>");
+    defer doc.deinit();
+    const sheets = [_][]const u8{"p { color: #ff0000 }"};
+    var p: DenyList = .init(testing.allocator);
+    defer p.deinit();
+    try p.loadDenyLines("deny * color\n");
+    try apply(doc.alloc(), &doc, "x.com", &p, &sheets);
+
+    const para = doc.root.first_child.?.first_child.?.first_child.?;
+    try testing.expectEqual(style.Color.default, para.computed.?.color);
+}
+
+test "css policy host-scoped: other host unaffected" {
+    var doc = try html.parse(testing.allocator,
+        \\<html><body><p style="color:#0000ff">x</p></body></html>
+    );
+    defer doc.deinit();
+    var p: DenyList = .init(testing.allocator);
+    defer p.deinit();
+    try p.loadDenyLines("deny ban.example color\n");
+    try apply(doc.alloc(), &doc, "other.example", &p, &.{});
+
+    const para = doc.root.first_child.?.first_child.?.first_child.?;
+    try testing.expectEqual(style.Color{ .rgb = .{ .r = 0, .g = 0, .b = 255 } }, para.computed.?.color);
 }
 
 test "inherited color flows to descendants, display does not" {

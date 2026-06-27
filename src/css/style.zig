@@ -10,6 +10,8 @@ pub const Color = union(enum) {
     rgb: struct { r: u8, g: u8, b: u8 },
 };
 
+pub const Var = struct { name: []const u8, value: []const u8 };
+
 pub const ComputedStyle = struct {
     display: Display = .inline_,
     white_space: WhiteSpace = .normal,
@@ -19,6 +21,7 @@ pub const ComputedStyle = struct {
     color: Color = .default,
     margin_top: u8 = 0,
     margin_bottom: u8 = 0,
+    vars: []const Var = &.{},
 
     pub const initial: ComputedStyle = .{};
 
@@ -29,6 +32,7 @@ pub const ComputedStyle = struct {
             .font_style = parent.font_style,
             .underline = parent.underline,
             .color = parent.color,
+            .vars = parent.vars,
             .display = .inline_,
         };
     }

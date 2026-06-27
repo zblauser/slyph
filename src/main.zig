@@ -6,6 +6,7 @@ const render = @import("render/text.zig");
 const viewer = @import("tui/viewer.zig");
 const forms = @import("forms/forms.zig");
 const cookies = @import("session/cookies.zig");
+const dom = @import("dom/node.zig");
 
 pub fn main(init: std.process.Init) void {
     run(init) catch std.process.exit(1);
@@ -41,9 +42,16 @@ fn run(init: std.process.Init) !void {
     defer policy.deinit();
     if (cookie_dir) |d| {
         if (std.fmt.allocPrint(arena, "{s}/cookies.policy", .{d}) catch null) |pf|
-            loadPolicy(io, gpa, &policy, d, pf);
+            loadDenyFile(io, gpa, &policy, d, pf, default_cookie_policy);
     }
     jar.policy = &policy;
+
+    var css_policy: cookies.Policy = .init(gpa);
+    defer css_policy.deinit();
+    if (cookie_dir) |d| {
+        if (std.fmt.allocPrint(arena, "{s}/css.policy", .{d}) catch null) |pf|
+            loadDenyFile(io, gpa, &css_policy, d, pf, default_css_policy);
+    }
     if (cookie_file) |f| loadCookies(io, gpa, &jar, f, now);
     defer if (cookie_dir) |d| saveCookies(io, gpa, &jar, d, cookie_file.?, now);
 
@@ -56,7 +64,8 @@ fn run(init: std.process.Init) !void {
     else
         &start_seed;
 
-    const term = terminalSize(io, std.Io.File.stdout());
+    var term = terminalSize(io, std.Io.File.stdout());
+    const truecolor = detectTruecolor(init.environ_map);
 
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
@@ -67,6 +76,9 @@ fn run(init: std.process.Init) !void {
     defer fwd.deinit(gpa);
     var nav: Nav = .{ .url = current };
 
+    if (term.tty) try viewer.beginUi(io);
+    defer if (term.tty) viewer.endUi(io);
+
     var redirects: u8 = 0;
     page_loop: while (true) {
         var body: std.Io.Writer.Allocating = .init(gpa);
@@ -74,7 +86,7 @@ fn run(init: std.process.Init) !void {
         var status: u16 = 200;
         if (std.mem.eql(u8, nav.url, start_url)) {
             try buildStartHtml(arena, bookmarks, &body.writer);
-        } else if (fetch(io, &client, &jar, arena, nav, &body, now)) |res| {
+        } else if (fetch(io, &client, &jar, arena, nav, &body, now, false)) |res| {
             if (res.status >= 300 and res.status < 400) {
                 if (res.location) |loc| {
                     if (redirects >= 10) {
@@ -97,12 +109,13 @@ fn run(init: std.process.Init) !void {
 
         var doc = try html.parse(gpa, body.writer.buffered());
         defer doc.deinit();
-        try cascade.apply(doc.alloc(), &doc);
+        const sheets = fetchLinkedCss(io, &client, &jar, doc.alloc(), nav.url, doc.root, now);
+        try cascade.apply(doc.alloc(), &doc, hostPath(nav.url).host, &css_policy, sheets);
         try forms.init(doc.alloc(), doc.root);
 
         if (!term.tty) {
             const pg = try layout.layout(scratch.allocator(), &doc, term.cols);
-            const frame = try render.render(scratch.allocator(), pg.root, false);
+            const frame = try render.render(scratch.allocator(), pg.root, false, truecolor);
             try std.Io.File.stdout().writeStreamingAll(io, frame);
             var b: [128]u8 = undefined;
             eprint(io, std.fmt.bufPrint(&b, "\n[status {d}] {s}\n", .{ status, doc.title }) catch "\n");
@@ -114,7 +127,7 @@ fn run(init: std.process.Init) !void {
             _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
             const pg = try layout.layout(sa, &doc, term.cols);
-            const frame = try render.render(sa, pg.root, true);
+            const frame = try render.render(sa, pg.root, true, truecolor);
             var b: [512]u8 = undefined;
             const bar = std.fmt.bufPrint(&b, " slyph  {s}  [{d}] {s}  ({d}L {d}F)  f·i·r·^L·H·L·q", .{ nav.url, status, doc.title, pg.links.len, pg.fields.len }) catch " slyph";
 
@@ -131,6 +144,7 @@ fn run(init: std.process.Init) !void {
                     continue :page_loop;
                 },
                 .reload => continue :page_loop,
+                .resize => term = terminalSize(io, std.Io.File.stdout()),
                 .follow => |href| {
                     try history.append(gpa, nav);
                     fwd.clearRetainingCapacity();
@@ -174,7 +188,7 @@ const Term = struct { cols: u16, rows: u16, tty: bool };
 
 const Fetched = struct { status: u16, location: ?[]const u8 = null };
 
-fn fetch(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, arena: std.mem.Allocator, nav: Nav, body: *std.Io.Writer.Allocating, now: i64) !Fetched {
+fn fetch(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, arena: std.mem.Allocator, nav: Nav, body: *std.Io.Writer.Allocating, now: i64, quiet: bool) !Fetched {
     const hp = hostPath(nav.url);
     const cookie_hdr = jar.header(arena, hp.host, hp.path, hp.secure, now) catch null;
 
@@ -194,18 +208,22 @@ fn fetch(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, arena: std.mem
     }
 
     const uri = std.Uri.parse(nav.url) catch |err| {
-        var buf: [256]u8 = undefined;
-        eprint(io, std.fmt.bufPrint(&buf, "bad url: {t}\n", .{err}) catch "bad url\n");
+        if (!quiet) {
+            var buf: [256]u8 = undefined;
+            eprint(io, std.fmt.bufPrint(&buf, "bad url: {t}\n", .{err}) catch "bad url\n");
+        }
         return err;
     };
     var req = client.request(nav.method, uri, .{
         .redirect_behavior = .unhandled,
         .extra_headers = hdrs[0..n],
     }) catch |err| {
-        var buf: [256]u8 = undefined;
-        eprint(io, std.fmt.bufPrint(&buf, "fetch failed: {t}\n", .{err}) catch "fetch failed\n");
-        if (err == error.TlsInitializationFailed)
-            eprint(io, "  (TLS handshake unsupported for this site — known std.crypto.tls gap)\n");
+        if (!quiet) {
+            var buf: [256]u8 = undefined;
+            eprint(io, std.fmt.bufPrint(&buf, "fetch failed: {t}\n", .{err}) catch "fetch failed\n");
+            if (err == error.TlsInitializationFailed)
+                eprint(io, "  (TLS handshake unsupported for this site — known std.crypto.tls gap)\n");
+        }
         return err;
     };
     defer req.deinit();
@@ -221,10 +239,12 @@ fn fetch(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, arena: std.mem
     }
 
     var response = req.receiveHead(&.{}) catch |err| {
-        var buf: [256]u8 = undefined;
-        eprint(io, std.fmt.bufPrint(&buf, "fetch failed: {t}\n", .{err}) catch "fetch failed\n");
-        if (err == error.TlsInitializationFailed)
-            eprint(io, "  (TLS handshake unsupported for this site — known std.crypto.tls gap)\n");
+        if (!quiet) {
+            var buf: [256]u8 = undefined;
+            eprint(io, std.fmt.bufPrint(&buf, "fetch failed: {t}\n", .{err}) catch "fetch failed\n");
+            if (err == error.TlsInitializationFailed)
+                eprint(io, "  (TLS handshake unsupported for this site — known std.crypto.tls gap)\n");
+        }
         return err;
     };
 
@@ -258,6 +278,55 @@ fn fetch(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, arena: std.mem
     return .{ .status = status, .location = location };
 }
 
+const max_sheets = 16;
+
+fn fetchLinkedCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, root: *dom.Node, now: i64) []const []const u8 {
+    var sheets: std.ArrayList([]const u8) = .empty;
+    var count: usize = 0;
+    collectCss(io, client, jar, da, base, root, now, &sheets, &count);
+    return sheets.toOwnedSlice(da) catch &.{};
+}
+
+fn collectCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, node: *dom.Node, now: i64, sheets: *std.ArrayList([]const u8), count: *usize) void {
+    if (count.* >= max_sheets) return;
+    if (node.kind == .element and std.ascii.eqlIgnoreCase(node.tag, "link") and isStylesheet(node)) {
+        if (node.attr("href")) |href| {
+            if (resolveUrl(da, base, href)) |url| {
+                if (fetchCssOne(io, client, jar, da, url, now)) |text| {
+                    sheets.append(da, text) catch {};
+                    count.* += 1;
+                }
+            } else |_| {}
+        }
+    }
+    var child = node.first_child;
+    while (child) |c| : (child = c.next_sibling) collectCss(io, client, jar, da, base, c, now, sheets, count);
+}
+
+fn isStylesheet(node: *dom.Node) bool {
+    const rel = node.attr("rel") orelse return false;
+    var it = std.mem.tokenizeAny(u8, rel, " \t");
+    while (it.next()) |t| if (std.ascii.eqlIgnoreCase(t, "stylesheet")) return true;
+    return false;
+}
+
+fn fetchCssOne(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, url: []const u8, now: i64) ?[]const u8 {
+    var u = url;
+    var hops: u8 = 0;
+    while (hops < 5) : (hops += 1) {
+        var body: std.Io.Writer.Allocating = .init(da);
+        const res = fetch(io, client, jar, da, .{ .url = u }, &body, now, true) catch return null;
+        if (res.status >= 300 and res.status < 400) {
+            const loc = res.location orelse return null;
+            u = resolveUrl(da, u, loc) catch return null;
+            continue;
+        }
+        if (res.status != 200) return null;
+        return body.writer.buffered();
+    }
+    return null;
+}
+
 const HostPath = struct { host: []const u8, path: []const u8, secure: bool };
 
 fn hostPath(url: []const u8) HostPath {
@@ -276,7 +345,7 @@ fn hostPath(url: []const u8) HostPath {
     return .{ .host = host, .path = path, .secure = secure };
 }
 
-const default_policy =
+const default_cookie_policy =
     \\# ~/.slyph/cookies.policy
     \\# slyph decides what cookies are necessary — you decide here, deeper than any browser.
     \\# Syntax:  deny <domain-glob> <name-glob>
@@ -301,14 +370,33 @@ const default_policy =
     \\
 ;
 
-fn loadPolicy(io: std.Io, gpa: std.mem.Allocator, policy: *cookies.Policy, dir: []const u8, file: []const u8) void {
+const default_css_policy =
+    \\# ~/.slyph/css.policy
+    \\# The site styles the page; you decide which of its styles slyph obeys.
+    \\# slyph's own UA defaults (block/inline, bold headings, link underline) always
+    \\# apply — these rules only strip styles the SITE asked for (author + inline css).
+    \\# Syntax:  deny <domain-glob> <property-glob>
+    \\#   domain-glob:   exact (example.com), suffix (*.nytimes.com), or any (*)
+    \\#   property-glob: exact (color), prefix (font-*), suffix (*-style), or any (*)
+    \\# Properties slyph renders: color, font-weight, font-style, text-decoration,
+    \\#   white-space, display, margin, margin-top, margin-bottom.
+    \\# Nothing is stripped by default — uncomment or add rules to opt in.
+    \\
+    \\# --- examples (commented; edit to taste) ---
+    \\# deny * color                 # ignore all author text colors, use terminal default
+    \\# deny *.example.com font-*    # drop a site's bold/italic insistence
+    \\# deny news.ycombinator.com color
+    \\
+;
+
+fn loadDenyFile(io: std.Io, gpa: std.mem.Allocator, policy: *cookies.Policy, dir: []const u8, file: []const u8, seed: []const u8) void {
     if (std.Io.Dir.cwd().readFileAlloc(io, file, gpa, .limited(1 << 20))) |bytes| {
         defer gpa.free(bytes);
         policy.loadDenyLines(bytes) catch {};
     } else |_| {
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = default_policy }) catch {};
-        policy.loadDenyLines(default_policy) catch {};
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = seed }) catch {};
+        policy.loadDenyLines(seed) catch {};
     }
 }
 
@@ -462,7 +550,7 @@ fn eqlAny(s: []const u8, opts: []const []const u8) bool {
     return false;
 }
 
-const version = "0.1.1";
+const version = "0.1.2";
 
 const help_text =
     \\slyph — terminal web browser (pure zig, own engine)
@@ -477,9 +565,14 @@ const help_text =
     \\  f follow link    i edit/activate field    r reload
     \\  ^L or :  url bar     H back     L forward     q quit
     \\
-    \\config in ~/.slyph/ : start, cookies.txt, cookies.policy
+    \\config in ~/.slyph/ : start, cookies.txt, cookies.policy, css.policy
     \\
 ;
+
+fn detectTruecolor(env: anytype) bool {
+    const ct = env.get("COLORTERM") orelse return false;
+    return std.mem.eql(u8, ct, "truecolor") or std.mem.eql(u8, ct, "24bit");
+}
 
 fn terminalSize(io: std.Io, file: std.Io.File) Term {
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
@@ -536,6 +629,7 @@ test "resolveUrl handles absolute, root, scheme and directory-relative" {
 }
 
 test {
+    _ = @import("policy.zig");
     _ = @import("dom/node.zig");
     _ = @import("html/tokenizer.zig");
     _ = @import("html/parser.zig");

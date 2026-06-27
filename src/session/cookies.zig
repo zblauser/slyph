@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const Policy = @import("../policy.zig").DenyList;
+
 pub const Cookie = struct {
     name: []const u8,
     value: []const u8,
@@ -177,62 +179,6 @@ pub const Jar = struct {
     }
 };
 
-pub const Policy = struct {
-    alloc: std.mem.Allocator,
-    rules: std.ArrayList(Rule) = .empty,
-
-    const Rule = struct { domain: []const u8, name: []const u8 };
-
-    pub fn init(alloc: std.mem.Allocator) Policy {
-        return .{ .alloc = alloc };
-    }
-
-    pub fn deinit(self: *Policy) void {
-        for (self.rules.items) |r| {
-            self.alloc.free(r.domain);
-            self.alloc.free(r.name);
-        }
-        self.rules.deinit(self.alloc);
-    }
-
-    pub fn loadDenyLines(self: *Policy, bytes: []const u8) !void {
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
-        while (lines.next()) |line| {
-            const t = std.mem.trim(u8, line, " \t\r");
-            if (t.len == 0 or t[0] == '#') continue;
-            var f = std.mem.tokenizeAny(u8, t, " \t");
-            const verb = f.next() orelse continue;
-            if (!std.mem.eql(u8, verb, "deny")) continue;
-            const domain = f.next() orelse continue;
-            const name = f.next() orelse continue;
-            try self.rules.append(self.alloc, .{
-                .domain = try self.alloc.dupe(u8, domain),
-                .name = try self.alloc.dupe(u8, name),
-            });
-        }
-    }
-
-    pub fn denied(self: *const Policy, domain: []const u8, name: []const u8) bool {
-        for (self.rules.items) |r| {
-            if (domainGlob(r.domain, domain) and nameGlob(r.name, name)) return true;
-        }
-        return false;
-    }
-};
-
-fn domainGlob(pat: []const u8, domain: []const u8) bool {
-    if (std.mem.eql(u8, pat, "*")) return true;
-    if (std.mem.startsWith(u8, pat, "*.")) return domainMatch(domain, pat[2..]);
-    return eqIgnoreCase(pat, domain);
-}
-
-fn nameGlob(pat: []const u8, s: []const u8) bool {
-    const star = std.mem.indexOfScalar(u8, pat, '*') orelse return std.mem.eql(u8, pat, s);
-    const pre = pat[0..star];
-    const suf = pat[star + 1 ..];
-    return s.len >= pre.len + suf.len and std.mem.startsWith(u8, s, pre) and std.mem.endsWith(u8, s, suf);
-}
-
 fn domainMatch(host: []const u8, domain: []const u8) bool {
     if (eqIgnoreCase(host, domain)) return true;
     if (host.len <= domain.len) return false;
@@ -386,23 +332,6 @@ test "serialize drops session cookies, round-trips persistent ones" {
     const h = (try jar2.header(std.testing.allocator, "www.x.com", "/app/x", true, 200)).?;
     defer std.testing.allocator.free(h);
     try std.testing.expectEqualStrings("keep=2", h);
-}
-
-test "policy glob matching" {
-    var p: Policy = .init(std.testing.allocator);
-    defer p.deinit();
-    try p.loadDenyLines(
-        \\# trackers
-        \\deny * _ga
-        \\deny * __utm*
-        \\deny *.doubleclick.net *
-        \\not-a-rule here
-    );
-    try std.testing.expect(p.denied("anything.com", "_ga"));
-    try std.testing.expect(p.denied("x.com", "__utm_source"));
-    try std.testing.expect(!p.denied("x.com", "_gat"));
-    try std.testing.expect(p.denied("ads.doubleclick.net", "anyname"));
-    try std.testing.expect(!p.denied("x.com", "sid"));
 }
 
 test "jar honors policy on store and send" {

@@ -7,7 +7,7 @@ no chromium, no webkit, no servo.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.1.1-000?style=flat-square&labelColor=500" alt="version"/>
+  <img src="https://img.shields.io/badge/version-v0.1.2-000?style=flat-square&labelColor=500" alt="version"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-000?style=flat-square&labelColor=500" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/zig-0.16-000?style=flat-square&labelColor=500" alt="zig 0.16"/>
 </p>
@@ -20,14 +20,23 @@ zig 0.16, single binary
 
 ## why
 browsers obey the server: the site says which cookies are "required," ships whatever js it likes, the browser complies.<br>
-slyph inverts that. it parses and runs everything itself, **every stage is a point where _you_, not the site, decide what's necessary.** running zero js is the most radical "deemed unnecessary." the cookie deny policy is the first concrete slice.
+slyph inverts that. it parses and runs everything itself, **every stage is a point where _you_, not the site, decide what's necessary.** running zero js is the most radical "deemed unnecessary." the cookie and css deny policies are the first concrete slices: one deny-rule surface, consulted per pipeline stage.
 
 > **[ ! ]** v0.1 is early. a working pure-zig text browser end to end:
 > - fetch + cookies, html5 parse, css cascade, block/inline layout, ansi render,
 > - scroll, links, forms, login. no javascript yet. expect rough edges.
 
 ## version
-<b>v0.1.1 (latest)</b>
+<b>v0.1.2 (latest)</b>
++ external `<link rel=stylesheet>` now fetched + cascaded (was inline `<style>` only)
++ css custom properties + `var(--x, fallback)`, `:root` selector
++ user-owned css deny policy (`~/.slyph/css.policy`), same engine as cookies
++ truecolor when the terminal supports it, else graceful xterm-256 fallback
++ no flicker between page loads; live terminal resize
+
+<details>
+<summary>previous</summary>
+<b>v0.1.1</b>
 + reload + back/forward history, with an in-app error page when a fetch fails
 + full keyboard scroll: arrows, page up/down, home/end
 + status bar shows the current url + scroll position
@@ -42,6 +51,7 @@ slyph inverts that. it parses and runs everything itself, **every stage is a poi
 + cookie jar (Set-Cookie capture/replay/persist), redirects per-hop
 + user-owned cookie deny policy
 + in-app url bar + configurable banner start page
+</details>
 
 ## build
 ```sh
@@ -83,8 +93,11 @@ visible and editable:
 - `~/.slyph/start` - start-page links, `name<TAB>url`, one per line.
 - `~/.slyph/cookies.txt` - persisted (non-session) cookies.
 - `~/.slyph/cookies.policy` - deny rules `deny <domain-glob> <name-glob>`.
+- `~/.slyph/css.policy` - deny rules `deny <domain-glob> <property-glob>`.
 
-ships seeded with common tracker rules; anything not denied is accepted as usual.
+cookies.policy ships seeded with common tracker rules; anything not denied is
+accepted as usual. css.policy ships opt-in (examples commented) so styling is
+unchanged until you add a rule - e.g. `deny * color` to ignore author text colors.
 
 > **[ ! ]** session cookies stay in memory only; just `cat`/edit the files.
 

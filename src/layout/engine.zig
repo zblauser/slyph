@@ -275,7 +275,7 @@ const cascade = @import("../css/cascade.zig");
 fn styledDoc(src: []const u8) !dom.Document {
     var doc = try html.parse(testing.allocator, src);
     errdefer doc.deinit();
-    try cascade.apply(doc.alloc(), &doc);
+    try cascade.apply(doc.alloc(), &doc, "", null, &.{});
     return doc;
 }
 

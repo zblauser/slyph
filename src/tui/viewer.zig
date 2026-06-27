@@ -8,6 +8,7 @@ pub const Action = union(enum) {
     back,
     forward,
     reload,
+    resize,
     follow: []const u8,
     navigate: []const u8,
     edit: struct { field: usize, value: []const u8 },
@@ -32,10 +33,6 @@ pub fn view(
     while (it.next()) |line| try lines.append(gpa, line);
 
     const out = std.Io.File.stdout();
-    const saved = try enterRaw();
-    defer restore(saved);
-    try out.writeStreamingAll(io, enter_ui);
-    defer out.writeStreamingAll(io, exit_ui) catch {};
 
     const page: u16 = if (rows > 1) rows - 1 else 1;
     const max_scroll: usize = if (lines.items.len > page) lines.items.len - page else 0;
@@ -45,8 +42,14 @@ pub fn view(
     defer buf.deinit(gpa);
 
     while (true) {
+        if (resized(io, cols, rows)) return .resize;
         try draw(gpa, io, out, &buf, lines.items, scroll.*, cols, page, bar);
-        switch (readByte() orelse break) {
+        const b = switch (pollByte(tick_ms)) {
+            .byte => |c| c,
+            .timeout => continue,
+            .eof => break,
+        };
+        switch (b) {
             'q' => return .quit,
             'H' => return .back,
             'L' => return .forward,
@@ -58,19 +61,26 @@ pub fn view(
             'g' => scroll.* = 0,
             'G' => scroll.* = max_scroll,
             0x1b => {
-                const intro = readByte() orelse break;
+                const intro = switch (pollByte(esc_ms)) {
+                    .byte => |c| c,
+                    else => continue,
+                };
                 if (intro != '[' and intro != 'O') continue;
-                switch (readByte() orelse break) {
+                const code = switch (pollByte(esc_ms)) {
+                    .byte => |c| c,
+                    else => continue,
+                };
+                switch (code) {
                     'A' => scroll.* -|= 1,
                     'B' => scroll.* = @min(scroll.* + 1, max_scroll),
                     'H' => scroll.* = 0,
                     'F' => scroll.* = max_scroll,
                     '5' => {
-                        _ = readByte();
+                        _ = pollByte(esc_ms);
                         scroll.* -|= page;
                     },
                     '6' => {
-                        _ = readByte();
+                        _ = pollByte(esc_ms);
                         scroll.* = @min(scroll.* + page, max_scroll);
                     },
                     else => {},
@@ -192,6 +202,21 @@ fn promptText(gpa: std.mem.Allocator, io: std.Io, out: std.Io.File, buf: *std.Ar
 const enter_ui = "\x1b[?1049h\x1b[?25l";
 const exit_ui = "\x1b[?25h\x1b[?1049l";
 
+const tick_ms: i32 = 100;
+const esc_ms: i32 = 50;
+
+var ui_termios: posix.termios = undefined;
+
+pub fn beginUi(io: std.Io) !void {
+    ui_termios = try enterRaw();
+    try std.Io.File.stdout().writeStreamingAll(io, enter_ui);
+}
+
+pub fn endUi(io: std.Io) void {
+    std.Io.File.stdout().writeStreamingAll(io, exit_ui) catch {};
+    restore(ui_termios);
+}
+
 fn enterRaw() !posix.termios {
     const saved = try posix.tcgetattr(posix.STDIN_FILENO);
     var raw = saved;
@@ -205,8 +230,35 @@ fn restore(saved: posix.termios) void {
     posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, saved) catch {};
 }
 
+const Poll = union(enum) { byte: u8, timeout, eof };
+
+fn pollByte(timeout_ms: i32) Poll {
+    var fds = [_]posix.pollfd{.{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 }};
+    const n = posix.poll(&fds, timeout_ms) catch return .eof;
+    if (n == 0) return .timeout;
+    var b: [1]u8 = undefined;
+    const r = posix.read(posix.STDIN_FILENO, &b) catch return .eof;
+    return if (r == 0) .eof else .{ .byte = b[0] };
+}
+
 fn readByte() ?u8 {
     var b: [1]u8 = undefined;
     const n = posix.read(posix.STDIN_FILENO, &b) catch return null;
     return if (n == 0) null else b[0];
+}
+
+fn resized(io: std.Io, cols: u16, rows: u16) bool {
+    const sz = currentSize(io) orelse return false;
+    return sz[0] != cols or sz[1] != rows;
+}
+
+fn currentSize(io: std.Io) ?[2]u16 {
+    var ws: posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const r = io.operate(.{ .device_io_control = .{
+        .file = std.Io.File.stdout(),
+        .code = posix.T.IOCGWINSZ,
+        .arg = &ws,
+    } }) catch return null;
+    if (r.device_io_control >= 0 and ws.col > 0) return .{ ws.col, ws.row };
+    return null;
 }

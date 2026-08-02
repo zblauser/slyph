@@ -1,4 +1,5 @@
 const std = @import("std");
+const eq = @import("../util.zig").eq;
 const dom = @import("../dom/node.zig");
 const style = @import("style.zig");
 const css = @import("parser.zig");
@@ -8,15 +9,23 @@ const ComputedStyle = style.ComputedStyle;
 
 pub const ua_css =
     \\html, body, div, section, article, header, footer, main, nav, aside,
-    \\p, ul, ol, li, dl, dt, dd, table, tr, figure, figcaption, blockquote,
+    \\p, ul, ol, li, dl, dt, dd, figure, figcaption, blockquote, caption, center,
     \\pre, form, fieldset, hr, h1, h2, h3, h4, h5, h6, address { display: block }
     \\li { display: list-item }
+    \\table { display: table }
+    \\thead, tbody, tfoot { display: table-row-group }
+    \\tr { display: table-row }
+    \\td, th { display: table-cell }
+    \\colgroup, col { display: none }
     \\head, title, meta, link, script, style, base, noscript { display: none }
     \\b, strong, h1, h2, h3, h4, h5, h6, th { font-weight: bold }
     \\i, em, cite, var, dfn { font-style: italic }
     \\a, u, ins { text-decoration: underline }
     \\pre, textarea { white-space: pre }
     \\p, ul, ol, blockquote, pre, figure, table, form { margin-top: 1; margin-bottom: 1 }
+    \\ul, ol { padding-left: 4 }
+    \\blockquote, dd { margin-left: 4 }
+    \\ul ul, ul ol, ol ul, ol ol { margin-top: 0; margin-bottom: 0 }
     \\h1, h2, h3, h4, h5, h6 { margin-top: 1; margin-bottom: 1 }
 ;
 
@@ -60,8 +69,104 @@ pub fn apply(a: std.mem.Allocator, doc: *dom.Document, host: []const u8, css_pol
     }
     try collectStyleElements(a, doc.root, &rules, &order);
 
-    const styler = Styler{ .a = a, .rules = rules.items, .host = host, .policy = css_policy };
+    var index = try RuleIndex.init(a, rules.items);
+    const styler = Styler{ .a = a, .rules = rules.items, .host = host, .policy = css_policy, .index = &index };
     try styler.styleNode(doc.root, ComputedStyle.initial);
+}
+
+const Entry = struct { rule: u32, sel: u32 };
+const Bucket = std.StringHashMapUnmanaged(std.ArrayList(Entry));
+
+const RuleIndex = struct {
+    a: std.mem.Allocator,
+    tags: Bucket = .empty,
+    classes: Bucket = .empty,
+    ids: Bucket = .empty,
+    universal: std.ArrayList(Entry) = .empty,
+    best: []u32,
+    seen: []u32,
+    stamp: u32 = 0,
+
+    fn init(a: std.mem.Allocator, rules: []const TaggedRule) !RuleIndex {
+        var self = RuleIndex{
+            .a = a,
+            .best = try a.alloc(u32, rules.len),
+            .seen = try a.alloc(u32, rules.len),
+        };
+        @memset(self.seen, 0);
+        for (rules, 0..) |tr, ri| {
+            for (tr.rule.selectors, 0..) |sel, si| {
+                const e = Entry{ .rule = @intCast(ri), .sel = @intCast(si) };
+                const key = keyOf(sel);
+                switch (key.kind) {
+                    .universal => try self.universal.append(a, e),
+                    .tag => try self.put(&self.tags, key.name, e),
+                    .class => try self.put(&self.classes, key.name, e),
+                    .id => try self.put(&self.ids, key.name, e),
+                }
+            }
+        }
+        return self;
+    }
+
+    fn put(self: *RuleIndex, bucket: *Bucket, name: []const u8, e: Entry) !void {
+        const gop = try bucket.getOrPut(self.a, name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.a, e);
+    }
+
+    fn gather(self: *RuleIndex, rules: []const TaggedRule, node: *dom.Node, out: *std.ArrayList(Candidate)) !void {
+        self.stamp += 1;
+        try self.tryAll(rules, self.universal.items, node, out);
+        if (self.tags.getPtr(node.tag)) |list| try self.tryAll(rules, list.items, node, out);
+        if (node.attr("id")) |id| {
+            if (self.ids.getPtr(id)) |list| try self.tryAll(rules, list.items, node, out);
+        }
+        if (node.attr("class")) |class_attr| {
+            var it = std.mem.tokenizeAny(u8, class_attr, " \t\r\n");
+            while (it.next()) |cls| {
+                if (self.classes.getPtr(cls)) |list| try self.tryAll(rules, list.items, node, out);
+            }
+        }
+    }
+
+    fn tryAll(self: *RuleIndex, rules: []const TaggedRule, entries: []const Entry, node: *dom.Node, out: *std.ArrayList(Candidate)) !void {
+        for (entries) |e| {
+            const tr = rules[e.rule];
+            const sel = tr.rule.selectors[e.sel];
+            if (!matches(sel, node)) continue;
+            const sp = sel.specificity();
+            if (self.seen[e.rule] == self.stamp) {
+                if (sp > self.best[e.rule]) {
+                    self.best[e.rule] = sp;
+                    for (out.items) |*c| {
+                        if (c.order == tr.order) c.specificity = sp;
+                    }
+                }
+                continue;
+            }
+            self.seen[e.rule] = self.stamp;
+            self.best[e.rule] = sp;
+            try out.append(self.a, .{
+                .origin = tr.origin,
+                .specificity = sp,
+                .order = tr.order,
+                .decls = tr.rule.decls,
+            });
+        }
+    }
+};
+
+const KeyKind = enum { universal, tag, class, id };
+const Key = struct { kind: KeyKind, name: []const u8 = "" };
+
+fn keyOf(sel: css.Selector) Key {
+    const last = sel.compounds[sel.compounds.len - 1];
+    if (last.id.len > 0) return .{ .kind = .id, .name = last.id };
+    if (last.classes.len > 0) return .{ .kind = .class, .name = last.classes[0] };
+    if (last.tag.len == 0 or std.mem.eql(u8, last.tag, "*")) return .{ .kind = .universal };
+    if (std.mem.eql(u8, last.tag, ":root")) return .{ .kind = .tag, .name = "html" };
+    return .{ .kind = .tag, .name = last.tag };
 }
 
 fn collectStyleElements(a: std.mem.Allocator, node: *dom.Node, rules: *std.ArrayList(TaggedRule), order: *u32) !void {
@@ -84,6 +189,7 @@ const Styler = struct {
     rules: []const TaggedRule,
     host: []const u8,
     policy: ?*const DenyList,
+    index: *RuleIndex,
 
     fn styleNode(self: Styler, node: *dom.Node, parent: ComputedStyle) !void {
         const cs = try self.a.create(ComputedStyle);
@@ -102,21 +208,7 @@ const Styler = struct {
         var cands: std.ArrayList(Candidate) = .empty;
         defer cands.deinit(self.a);
 
-        for (self.rules) |tr| {
-            var best: ?u32 = null;
-            for (tr.rule.selectors) |sel| {
-                if (matches(sel, node)) {
-                    const sp = sel.specificity();
-                    if (best == null or sp > best.?) best = sp;
-                }
-            }
-            if (best) |sp| try cands.append(self.a, .{
-                .origin = tr.origin,
-                .specificity = sp,
-                .order = tr.order,
-                .decls = tr.rule.decls,
-            });
-        }
+        try self.index.gather(self.rules, node, &cands);
 
         if (node.attr("style")) |inline_css| {
             const ss = try css.parse(self.a, try std.fmt.allocPrint(self.a, "*{{{s}}}", .{inline_css}));
@@ -251,7 +343,7 @@ fn lookupVar(vars: []const style.Var, name: []const u8) ?[]const u8 {
 fn applyDecl(cs: *ComputedStyle, d: css.Declaration) void {
     const v = d.value;
     if (eq(d.name, "display")) {
-        if (eq(v, "block")) cs.display = .block else if (eq(v, "inline")) cs.display = .inline_ else if (eq(v, "inline-block")) cs.display = .inline_block else if (eq(v, "list-item")) cs.display = .list_item else if (eq(v, "none")) cs.display = .none;
+        if (eq(v, "block")) cs.display = .block else if (eq(v, "inline")) cs.display = .inline_ else if (eq(v, "inline-block")) cs.display = .inline_block else if (eq(v, "list-item")) cs.display = .list_item else if (eq(v, "table") or eq(v, "inline-table")) cs.display = .table else if (eq(v, "table-row-group") or eq(v, "table-header-group") or eq(v, "table-footer-group")) cs.display = .table_row_group else if (eq(v, "table-row")) cs.display = .table_row else if (eq(v, "table-cell")) cs.display = .table_cell else if (eq(v, "none")) cs.display = .none;
     } else if (eq(d.name, "white-space")) {
         cs.white_space = if (std.mem.startsWith(u8, v, "pre")) .pre else .normal;
     } else if (eq(d.name, "font-weight")) {
@@ -269,6 +361,8 @@ fn applyDecl(cs: *ComputedStyle, d: css.Declaration) void {
             cs.margin_top = n;
             cs.margin_bottom = n;
         }
+    } else if (eq(d.name, "margin-left") or eq(d.name, "padding-left")) {
+        if (firstLineCount(v)) |n| cs.indent = n;
     } else if (eq(d.name, "margin-top")) {
         if (firstLineCount(v)) |n| cs.margin_top = n;
     } else if (eq(d.name, "margin-bottom")) {
@@ -280,10 +374,6 @@ fn firstLineCount(v: []const u8) ?u8 {
     var it = std.mem.tokenizeAny(u8, v, " \t");
     const first = it.next() orelse return null;
     return std.fmt.parseInt(u8, first, 10) catch null;
-}
-
-fn eq(a: []const u8, b: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(a, b);
 }
 
 fn parseColor(v: []const u8) ?style.Color {
@@ -303,13 +393,13 @@ fn parseColor(v: []const u8) ?style.Color {
 }
 
 fn parseHex(h: []const u8) ?style.Color {
-    if (h.len == 3) {
+    if (h.len == 3 or h.len == 4) {
         const r = hexNibble(h[0]) orelse return null;
         const g = hexNibble(h[1]) orelse return null;
         const b = hexNibble(h[2]) orelse return null;
         return .{ .rgb = .{ .r = r * 17, .g = g * 17, .b = b * 17 } };
     }
-    if (h.len == 6) {
+    if (h.len == 6 or h.len == 8) {
         const r = std.fmt.parseInt(u8, h[0..2], 16) catch return null;
         const g = std.fmt.parseInt(u8, h[2..4], 16) catch return null;
         const b = std.fmt.parseInt(u8, h[4..6], 16) catch return null;
@@ -366,6 +456,14 @@ test "author style overrides UA, specificity + inline win" {
     const pn = p.?;
     try testing.expectEqual(style.Display.inline_, pn.computed.?.display);
     try testing.expectEqual(style.Color{ .rgb = .{ .r = 0, .g = 0, .b = 255 } }, pn.computed.?.color);
+}
+
+test "hex colors: 3, 4, 6 and 8 digit forms" {
+    try testing.expectEqual(style.Color{ .rgb = .{ .r = 0x11, .g = 0x22, .b = 0x33 } }, parseHex("123").?);
+    try testing.expectEqual(style.Color{ .rgb = .{ .r = 0x11, .g = 0x22, .b = 0x33 } }, parseHex("123f").?);
+    try testing.expectEqual(style.Color{ .rgb = .{ .r = 0xb8, .g = 0x96, .b = 0x56 } }, parseHex("b89656").?);
+    try testing.expectEqual(style.Color{ .rgb = .{ .r = 0xb8, .g = 0x96, .b = 0x56 } }, parseHex("b8965680").?);
+    try testing.expect(parseHex("12345") == null);
 }
 
 test "css policy strips denied author property, leaves UA + other props" {

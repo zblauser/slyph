@@ -1,4 +1,5 @@
 const std = @import("std");
+const eq = @import("../util.zig").eq;
 const dom = @import("../dom/node.zig");
 
 pub const Kind = enum { text, password, checkbox, radio, submit, hidden };
@@ -117,10 +118,6 @@ fn percentEncode(a: std.mem.Allocator, s: []const u8, out: *std.ArrayList(u8)) !
             try out.appendSlice(a, &.{ '%', hex[c >> 4], hex[c & 0xf] });
         }
     }
-}
-
-fn eq(x: []const u8, y: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(x, y);
 }
 
 const testing = std.testing;

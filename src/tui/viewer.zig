@@ -207,6 +207,26 @@ const esc_ms: i32 = 50;
 
 var ui_termios: posix.termios = undefined;
 
+pub fn progress(io: std.Io, cols: u16, rows: u16, text: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    std.Io.File.stdout().writeStreamingAll(io, progressBytes(&buf, cols, rows, text)) catch {};
+}
+
+fn progressBytes(buf: []u8, cols: u16, rows: u16, text: []const u8) []u8 {
+    const tail = "\x1b[0m";
+    const head = std.fmt.bufPrint(buf, "\x1b[{d};1H\x1b[7m", .{rows}) catch return buf[0..0];
+    var n = head.len;
+    if (n + tail.len >= buf.len) return buf[0..0];
+    const width: usize = @min(@as(usize, cols), buf.len - n - tail.len);
+    var w: usize = 0;
+    while (w < width) : (w += 1) {
+        buf[n] = if (w < text.len) text[w] else ' ';
+        n += 1;
+    }
+    @memcpy(buf[n..][0..tail.len], tail);
+    return buf[0 .. n + tail.len];
+}
+
 pub fn beginUi(io: std.Io) !void {
     ui_termios = try enterRaw();
     try std.Io.File.stdout().writeStreamingAll(io, enter_ui);
@@ -261,4 +281,16 @@ fn currentSize(io: std.Io) ?[2]u16 {
     } }) catch return null;
     if (r.device_io_control >= 0 and ws.col > 0) return .{ ws.col, ws.row };
     return null;
+}
+
+test "progress line targets the last row, pads to width, resets sgr" {
+    var buf: [1024]u8 = undefined;
+    const out = progressBytes(&buf, 12, 24, " loading");
+    try std.testing.expectEqualStrings("\x1b[24;1H\x1b[7m loading    \x1b[0m", out);
+}
+
+test "progress truncates text longer than the terminal" {
+    var buf: [1024]u8 = undefined;
+    const out = progressBytes(&buf, 5, 3, " loading https://example.com/very/long");
+    try std.testing.expectEqualStrings("\x1b[3;1H\x1b[7m load\x1b[0m", out);
 }

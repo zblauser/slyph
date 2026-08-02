@@ -7,7 +7,7 @@ no chromium, no webkit, no servo.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.1.2-000?style=flat-square&labelColor=500" alt="version"/>
+  <img src="https://img.shields.io/badge/version-v0.1.3-000?style=flat-square&labelColor=500" alt="version"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-000?style=flat-square&labelColor=500" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/zig-0.16-000?style=flat-square&labelColor=500" alt="zig 0.16"/>
 </p>
@@ -16,42 +16,41 @@ zig 0.16, single binary
 - fetches raw bytes and runs the whole pipeline itself:<br>
 `fetch > html parse > dom > css cascade > layout > render > terminal cells`
 - networking via zig std (`std.http.Client` + `std.crypto.tls`)
-- the only planned non-zig code is QuickJS (C) for js, at v0.2
+- runs no javascript at all: nothing on a page executes (see [planned](#planned))
 
 ## why
 browsers obey the server: the site says which cookies are "required," ships whatever js it likes, the browser complies.<br>
 slyph inverts that. it parses and runs everything itself, **every stage is a point where _you_, not the site, decide what's necessary.** running zero js is the most radical "deemed unnecessary." the cookie and css deny policies are the first concrete slices: one deny-rule surface, consulted per pipeline stage.
 
 > **[ ! ]** v0.1 is early. a working pure-zig text browser end to end:
-> - fetch + cookies, html5 parse, css cascade, block/inline layout, ansi render,
+> - fetch + cookies, html5 parse, css cascade, block/inline + table layout, ansi render,
 > - scroll, links, forms, login. no javascript yet. expect rough edges.
 
 ## version
-<b>v0.1.2 (latest)</b>
-+ external `<link rel=stylesheet>` now fetched + cascaded (was inline `<style>` only)
-+ css custom properties + `var(--x, fallback)`, `:root` selector
-+ user-owned css deny policy (`~/.slyph/css.policy`), same engine as cookies
-+ truecolor when the terminal supports it, else graceful xterm-256 fallback
-+ no flicker between page loads; live terminal resize
+<b>v0.1.3 (latest)</b>
++ **table layout** - `display:table/row/cell`, colspan + rowspan, automatic column
+  widths from min/max content measurement. hn, forums and wikipedia comparison
+  tables render as real tables instead of one flat text run
++ `<img>` renders: alt text as content, or width-based spacers (restores hn comment indent)
++ document structure: nested list indentation, `<ol>` numbering (with `start`),
+  indented `<blockquote>`/`<dd>`, `<hr>` drawn as a rule
++ loading indicator - per-stage progress on the status line while a page loads
++ indexed cascade - a page with 1.1 mb of css went from 3.5s to 0.37s
++ fixed a parser hang: a stray `}` in any css could spin the browser forever
++ prebuilt binaries for linux, macos and freebsd
 
-<details>
-<summary>previous</summary>
-<b>v0.1.1</b>
-+ reload + back/forward history, with an in-app error page when a fetch fails
-+ full keyboard scroll: arrows, page up/down, home/end
-+ status bar shows the current url + scroll position
+earlier versions: [CHANGELOG.md](CHANGELOG.md)
 
-<b>v0.1</b>
-+ pure-zig text browser end to end, zero C
-+ html5 tokenizer + tree builder → dom
-+ css parser + cascade + computed style (specificity, inherit)
-+ block/inline layout → box tree (margins, wrap, lists, pre)
-+ text-mode ansi renderer + scrolling tui
-+ forms (text/pw/checkbox/radio/submit), GET + POST
-+ cookie jar (Set-Cookie capture/replay/persist), redirects per-hop
-+ user-owned cookie deny policy
-+ in-app url bar + configurable banner start page
-</details>
+## install
+prebuilt binaries are on the [releases](https://github.com/zblauser/slyph/releases) page:
+linux (x86, x86_64, arm64, riscv64), macos (intel, apple silicon), freebsd.
+
+```sh
+tar xzf slyph-*.tar.gz && chmod +x slyph && ./slyph
+```
+
+the linux builds are static musl - no libc to install, nothing to link. the 32-bit
+x86 build is small enough to run under [ish](https://ish.app) on ios.
 
 ## build
 ```sh
@@ -103,11 +102,13 @@ unchanged until you add a rule - e.g. `deny * color` to ignore author text color
 
 ## known limitations
 - no javascript yet - js-heavy app sites (gmail, telegram, discord) render mostly empty. static / server-rendered sites work now.
-- `std.crypto.tls` (zig 0.16) handshakes fail on some ecdsa-cert hosts (e.g. `news.ycombinator.com`). most sites work; bounded upstream gap.
-- no flexbox/grid, images, or video yet.
+- `std.crypto.tls` (zig 0.16) handshakes fail on some ecdsa-cert hosts. most sites work; bounded upstream gap.
+- no flexbox/grid or video yet. images are not drawn - you get the alt text.
+- tables have no borders; columns are space-separated. a cell spanning rows is placed on its own row, not stretched down.
+- pages that link a lot of css are slow: sub-resources are fetched one at a time, and the cascade matches every rule against every node.
 
 ## planned
-- quickjs + core dom bindings > light-js sites
+- a js engine + core dom bindings > light-js sites, with per-origin run/skip policy
 - flexbox / grid + more dom/cssom > modern layouts
 - pixel mode (sixel / kitty + ansi-block fallback) > images
 - heavy js apps, eventually media

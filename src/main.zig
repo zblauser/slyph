@@ -7,6 +7,7 @@ const viewer = @import("tui/viewer.zig");
 const forms = @import("forms/forms.zig");
 const cookies = @import("session/cookies.zig");
 const dom = @import("dom/node.zig");
+const eqAny = @import("util.zig").eqAny;
 
 pub fn main(init: std.process.Init) void {
     run(init) catch std.process.exit(1);
@@ -19,8 +20,8 @@ fn run(init: std.process.Init) !void {
 
     const argv = try init.minimal.args.toSlice(arena);
     if (argv.len >= 2) {
-        if (eqlAny(argv[1], &.{ "-h", "--help" })) return print(io, help_text);
-        if (eqlAny(argv[1], &.{ "-v", "--version" })) return print(io, "slyph " ++ version ++ "\n");
+        if (eqAny(argv[1], &.{ "-h", "--help" })) return print(io, help_text);
+        if (eqAny(argv[1], &.{ "-v", "--version" })) return print(io, "slyph " ++ version ++ "\n");
     }
     const current: []const u8 = if (argv.len < 2) start_url else try absoluteUrl(arena, argv[1]);
 
@@ -81,12 +82,16 @@ fn run(init: std.process.Init) !void {
 
     var redirects: u8 = 0;
     page_loop: while (true) {
+        const ui: ?Ui = if (term.tty) .{ .io = io, .cols = term.cols, .rows = term.rows } else null;
         var body: std.Io.Writer.Allocating = .init(gpa);
         defer body.deinit();
         var status: u16 = 200;
         if (std.mem.eql(u8, nav.url, start_url)) {
             try buildStartHtml(arena, bookmarks, &body.writer);
-        } else if (fetch(io, &client, &jar, arena, nav, &body, now, false)) |res| {
+        } else if (blk: {
+            showStage(ui, " loading  {s}", .{nav.url});
+            break :blk fetch(io, &client, &jar, arena, nav, &body, now, false);
+        }) |res| {
             if (res.status >= 300 and res.status < 400) {
                 if (res.location) |loc| {
                     if (redirects >= 10) {
@@ -95,6 +100,7 @@ fn run(init: std.process.Init) !void {
                     }
                     redirects += 1;
                     nav = .{ .url = try resolveUrl(arena, nav.url, loc) };
+                    showStage(ui, " redirect  {s}", .{nav.url});
                     continue :page_loop;
                 }
             }
@@ -107,11 +113,14 @@ fn run(init: std.process.Init) !void {
             try buildErrorHtml(nav.url, err, &body.writer);
         }
 
+        showStage(ui, " parsing  {d} KB", .{body.writer.buffered().len / 1024});
         var doc = try html.parse(gpa, body.writer.buffered());
         defer doc.deinit();
-        const sheets = fetchLinkedCss(io, &client, &jar, doc.alloc(), nav.url, doc.root, now);
+        const sheets = fetchLinkedCss(io, &client, &jar, doc.alloc(), nav.url, doc.root, now, ui);
+        showStage(ui, " styling  {d} sheet{s}", .{ sheets.len, if (sheets.len == 1) "" else "s" });
         try cascade.apply(doc.alloc(), &doc, hostPath(nav.url).host, &css_policy, sheets);
         try forms.init(doc.alloc(), doc.root);
+        showStage(ui, " rendering", .{});
 
         if (!term.tty) {
             const pg = try layout.layout(scratch.allocator(), &doc, term.cols);
@@ -183,6 +192,14 @@ const Nav = struct {
     method: std.http.Method = .GET,
     body: ?[]const u8 = null,
 };
+
+const Ui = struct { io: std.Io, cols: u16, rows: u16 };
+
+fn showStage(ui: ?Ui, comptime fmt: []const u8, args: anytype) void {
+    const u = ui orelse return;
+    var b: [512]u8 = undefined;
+    viewer.progress(u.io, u.cols, u.rows, std.fmt.bufPrint(&b, fmt, args) catch return);
+}
 
 const Term = struct { cols: u16, rows: u16, tty: bool };
 
@@ -280,18 +297,19 @@ fn fetch(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, arena: std.mem
 
 const max_sheets = 16;
 
-fn fetchLinkedCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, root: *dom.Node, now: i64) []const []const u8 {
+fn fetchLinkedCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, root: *dom.Node, now: i64, ui: ?Ui) []const []const u8 {
     var sheets: std.ArrayList([]const u8) = .empty;
     var count: usize = 0;
-    collectCss(io, client, jar, da, base, root, now, &sheets, &count);
+    collectCss(io, client, jar, da, base, root, now, &sheets, &count, ui);
     return sheets.toOwnedSlice(da) catch &.{};
 }
 
-fn collectCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, node: *dom.Node, now: i64, sheets: *std.ArrayList([]const u8), count: *usize) void {
+fn collectCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, node: *dom.Node, now: i64, sheets: *std.ArrayList([]const u8), count: *usize, ui: ?Ui) void {
     if (count.* >= max_sheets) return;
     if (node.kind == .element and std.ascii.eqlIgnoreCase(node.tag, "link") and isStylesheet(node)) {
         if (node.attr("href")) |href| {
             if (resolveUrl(da, base, href)) |url| {
+                showStage(ui, " stylesheet {d}/{d}  {s}", .{ count.* + 1, max_sheets, url });
                 if (fetchCssOne(io, client, jar, da, url, now)) |text| {
                     sheets.append(da, text) catch {};
                     count.* += 1;
@@ -300,7 +318,7 @@ fn collectCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.m
         }
     }
     var child = node.first_child;
-    while (child) |c| : (child = c.next_sibling) collectCss(io, client, jar, da, base, c, now, sheets, count);
+    while (child) |c| : (child = c.next_sibling) collectCss(io, client, jar, da, base, c, now, sheets, count, ui);
 }
 
 fn isStylesheet(node: *dom.Node) bool {
@@ -545,12 +563,7 @@ fn print(io: std.Io, msg: []const u8) void {
     std.Io.File.stdout().writeStreamingAll(io, msg) catch {};
 }
 
-fn eqlAny(s: []const u8, opts: []const []const u8) bool {
-    for (opts) |o| if (std.mem.eql(u8, s, o)) return true;
-    return false;
-}
-
-const version = "0.1.2";
+const version = "0.1.3";
 
 const help_text =
     \\slyph — terminal web browser (pure zig, own engine)
@@ -629,6 +642,7 @@ test "resolveUrl handles absolute, root, scheme and directory-relative" {
 }
 
 test {
+    _ = @import("util.zig");
     _ = @import("policy.zig");
     _ = @import("dom/node.zig");
     _ = @import("html/tokenizer.zig");
@@ -641,4 +655,5 @@ test {
     _ = @import("render/text.zig");
     _ = @import("forms/forms.zig");
     _ = @import("session/cookies.zig");
+    _ = @import("tui/viewer.zig");
 }

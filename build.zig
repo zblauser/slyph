@@ -4,12 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const strip = b.option(bool, "strip", "strip debug info (for release binaries)") orelse false;
+
     const exe = b.addExecutable(.{
         .name = "slyph",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
     b.installArtifact(exe);

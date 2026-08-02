@@ -1,4 +1,7 @@
 const std = @import("std");
+const util = @import("../util.zig");
+const lower = util.lower;
+const isWs = util.isWs;
 
 pub const Attr = struct { name: []const u8, value: []const u8 };
 
@@ -165,9 +168,6 @@ pub const Tokenizer = struct {
     }
 };
 
-fn isWs(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0c;
-}
 fn isNameChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '-' or c == ':' or c == '_';
 }
@@ -182,12 +182,6 @@ pub fn isRawText(name: []const u8) bool {
     const set = [_][]const u8{ "script", "style", "title", "textarea" };
     for (set) |s| if (std.mem.eql(u8, name, s)) return true;
     return false;
-}
-
-fn lower(alloc: std.mem.Allocator, s: []const u8) []const u8 {
-    const out = alloc.alloc(u8, s.len) catch return s;
-    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
-    return out;
 }
 
 test "tokenize tags, attrs, text" {

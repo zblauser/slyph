@@ -1,4 +1,7 @@
 const std = @import("std");
+const util = @import("../util.zig");
+const lower = util.lower;
+const isWs = util.isWs;
 
 pub const Combinator = enum { descendant, child };
 
@@ -52,7 +55,9 @@ pub fn parse(a: std.mem.Allocator, src: []const u8) !Stylesheet {
             p.skipAtRule();
             continue;
         }
+        const before = p.pos;
         if (try p.rule()) |r| try rules.append(a, r);
+        if (p.pos == before) p.pos += 1;
     }
     return .{ .rules = try rules.toOwnedSlice(a) };
 }
@@ -65,7 +70,10 @@ const Parser = struct {
     fn rule(self: *Parser) !?Rule {
         const sel_start = self.pos;
         while (self.pos < self.src.len and self.src[self.pos] != '{') {
-            if (self.src[self.pos] == '}') return null;
+            if (self.src[self.pos] == '}') {
+                self.pos += 1;
+                return null;
+            }
             self.advancePastComments();
             if (self.pos < self.src.len and self.src[self.pos] != '{') self.pos += 1;
         }
@@ -213,14 +221,20 @@ const Parser = struct {
     }
 };
 
-fn isWs(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0c;
+test "stray closing brace does not stall the parser" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ss = try parse(arena.allocator(), "*{ width: {{{width}}}}");
+    try std.testing.expectEqual(@as(usize, 1), ss.rules.len);
+    try std.testing.expectEqualStrings("width", ss.rules[0].decls[0].name);
 }
 
-fn lower(a: std.mem.Allocator, s: []const u8) []const u8 {
-    const out = a.alloc(u8, s.len) catch return s;
-    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
-    return out;
+test "unbalanced braces and junk still terminate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "}}}}", "}p{color:red}", "{{{{", "a{b:c", "@media{", "", "*{a:}}}" }) |src| {
+        _ = try parse(arena.allocator(), src);
+    }
 }
 
 test "parse a simple rule" {

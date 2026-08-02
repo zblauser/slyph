@@ -1,6 +1,23 @@
 const std = @import("std");
 
-pub const Display = enum { block, inline_, inline_block, list_item, none };
+pub const Display = enum {
+    block,
+    inline_,
+    inline_block,
+    list_item,
+    table,
+    table_row_group,
+    table_row,
+    table_cell,
+    none,
+
+    pub fn isBlockLevel(self: Display) bool {
+        return switch (self) {
+            .block, .list_item, .table, .table_row_group, .table_row, .table_cell => true,
+            .inline_, .inline_block, .none => false,
+        };
+    }
+};
 pub const FontWeight = enum { normal, bold };
 pub const FontStyle = enum { normal, italic };
 pub const WhiteSpace = enum { normal, pre };
@@ -21,6 +38,7 @@ pub const ComputedStyle = struct {
     color: Color = .default,
     margin_top: u8 = 0,
     margin_bottom: u8 = 0,
+    indent: u8 = 0,
     vars: []const Var = &.{},
 
     pub const initial: ComputedStyle = .{};

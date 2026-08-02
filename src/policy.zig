@@ -1,4 +1,5 @@
 const std = @import("std");
+const domainMatch = @import("util.zig").domainMatch;
 
 pub const DenyList = struct {
     alloc: std.mem.Allocator,
@@ -54,13 +55,6 @@ pub fn keyGlob(pat: []const u8, s: []const u8) bool {
     const pre = pat[0..star];
     const suf = pat[star + 1 ..];
     return s.len >= pre.len + suf.len and std.mem.startsWith(u8, s, pre) and std.mem.endsWith(u8, s, suf);
-}
-
-fn domainMatch(host: []const u8, domain: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(host, domain)) return true;
-    if (host.len <= domain.len) return false;
-    const suffix = host[host.len - domain.len ..];
-    return host[host.len - domain.len - 1] == '.' and std.ascii.eqlIgnoreCase(suffix, domain);
 }
 
 test "deny glob matching: domain + key globs" {

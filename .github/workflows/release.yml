@@ -1,0 +1,72 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test
+      - run: zig fmt --check src/
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86-linux-musl
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - riscv64-linux-musl
+          - x86_64-macos
+          - aarch64-macos
+          - x86_64-freebsd
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSmall -Dstrip=true --prefix out
+
+      - name: package
+        run: |
+          install -d dist
+          tar -czf dist/slyph-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C out/bin slyph
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slyph-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

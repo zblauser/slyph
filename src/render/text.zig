@@ -5,11 +5,26 @@ const style = @import("../css/style.zig");
 const Box = boxmod.Box;
 
 pub fn render(a: std.mem.Allocator, root: Box, ansi: bool, truecolor: bool) ![]u8 {
+    var runs: std.ArrayList(Box) = .empty;
+    defer runs.deinit(a);
+    try collect(a, root, &runs);
+    std.mem.sort(Box, runs.items, {}, beforeInFlow);
+
     var out: std.ArrayList(u8) = .empty;
     var c = Cursor{ .a = a, .out = &out, .ansi = ansi, .truecolor = truecolor };
-    try c.walk(root);
+    for (runs.items) |run| try c.paint(run);
     try out.append(a, '\n');
     return out.toOwnedSlice(a);
+}
+
+fn collect(a: std.mem.Allocator, box: Box, out: *std.ArrayList(Box)) !void {
+    if (box.kind == .text) try out.append(a, box);
+    for (box.children) |child| try collect(a, child, out);
+}
+
+fn beforeInFlow(_: void, a: Box, b: Box) bool {
+    if (a.rect.y != b.rect.y) return a.rect.y < b.rect.y;
+    return a.rect.x < b.rect.x;
 }
 
 const Cursor = struct {
@@ -20,13 +35,10 @@ const Cursor = struct {
     row: u16 = 0,
     col: u16 = 0,
 
-    fn walk(self: *Cursor, box: Box) !void {
-        if (box.kind == .text) {
-            try self.moveTo(box.rect.x, box.rect.y);
-            try self.emit(box.text, box.style);
-            self.col += @intCast(boxmod.cellWidth(box.text));
-        }
-        for (box.children) |child| try self.walk(child);
+    fn paint(self: *Cursor, box: Box) !void {
+        try self.moveTo(box.rect.x, box.rect.y);
+        try self.emit(box.text, box.style);
+        self.col += @intCast(boxmod.cellWidth(box.text));
     }
 
     fn moveTo(self: *Cursor, x: u16, y: u16) !void {
@@ -173,6 +185,20 @@ test "rgbTo256 maps cube and grayscale corners" {
     try testing.expectEqual(@as(u8, 231), rgbTo256(255, 255, 255));
     try testing.expectEqual(@as(u8, 196), rgbTo256(255, 0, 0));
     try testing.expectEqual(@as(u8, 21), rgbTo256(0, 0, 255));
+}
+
+test "table renders as aligned text columns" {
+    const src = "<body><table><tr><td>id</td><td>name</td></tr><tr><td>7</td><td>zig</td></tr></table></body>";
+    const out = try renderHtml(src, 80, false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("id name\n7  zig\n", out);
+}
+
+test "cells emit in reading order across a row, not per-cell" {
+    const src = "<body><table><tr><td>aa bb</td><td>right</td></tr></table></body>";
+    const out = try renderHtml(src, 9, false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("aa  right\nbb\n", out);
 }
 
 test "css policy strips author color from rendered ansi, keeps bold" {

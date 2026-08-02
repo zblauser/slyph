@@ -1,4 +1,7 @@
 const std = @import("std");
+const util = @import("../util.zig");
+const eqIgnoreCase = util.eq;
+const domainMatch = util.domainMatch;
 
 pub const Policy = @import("../policy.zig").DenyList;
 
@@ -179,13 +182,6 @@ pub const Jar = struct {
     }
 };
 
-fn domainMatch(host: []const u8, domain: []const u8) bool {
-    if (eqIgnoreCase(host, domain)) return true;
-    if (host.len <= domain.len) return false;
-    const suffix = host[host.len - domain.len ..];
-    return host[host.len - domain.len - 1] == '.' and eqIgnoreCase(suffix, domain);
-}
-
 fn pathMatch(req: []const u8, cookie: []const u8) bool {
     if (std.mem.eql(u8, req, cookie)) return true;
     if (!std.mem.startsWith(u8, req, cookie)) return false;
@@ -196,10 +192,6 @@ fn defaultPath(path: []const u8) []const u8 {
     if (path.len == 0 or path[0] != '/') return "/";
     const last = std.mem.lastIndexOfScalar(u8, path, '/').?;
     return if (last == 0) "/" else path[0..last];
-}
-
-fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(a, b);
 }
 
 fn lowerDupe(alloc: std.mem.Allocator, s: []const u8) ![]u8 {

@@ -3,11 +3,14 @@ const html = @import("html/parser.zig");
 const cascade = @import("css/cascade.zig");
 const layout = @import("layout/engine.zig");
 const render = @import("render/text.zig");
+const thememod = @import("render/theme.zig");
 const viewer = @import("tui/viewer.zig");
+const termmod = @import("tui/term.zig");
 const forms = @import("forms/forms.zig");
 const cookies = @import("session/cookies.zig");
 const dom = @import("dom/node.zig");
-const eqAny = @import("util.zig").eqAny;
+const util = @import("util.zig");
+const eqAny = util.eqAny;
 
 pub fn main(init: std.process.Init) void {
     run(init) catch std.process.exit(1);
@@ -53,6 +56,23 @@ fn run(init: std.process.Init) !void {
         if (std.fmt.allocPrint(arena, "{s}/css.policy", .{d}) catch null) |pf|
             loadDenyFile(io, gpa, &css_policy, d, pf, default_css_policy);
     }
+    var fetch_policy: cookies.Policy = .init(gpa);
+    defer fetch_policy.deinit();
+    if (cookie_dir) |d| {
+        if (std.fmt.allocPrint(arena, "{s}/fetch.policy", .{d}) catch null) |pf|
+            loadDenyFile(io, gpa, &fetch_policy, d, pf, default_fetch_policy);
+    }
+
+    var theme: thememod.Theme = .terminal;
+    if (cookie_dir) |d| {
+        if (std.fmt.allocPrint(arena, "{s}/theme", .{d}) catch null) |tf| {
+            if (std.Io.Dir.cwd().readFileAlloc(io, tf, gpa, .limited(1 << 16))) |bytes| {
+                defer gpa.free(bytes);
+                theme.loadLines(bytes);
+            } else |_| {}
+        }
+    }
+
     if (cookie_file) |f| loadCookies(io, gpa, &jar, f, now);
     defer if (cookie_dir) |d| saveCookies(io, gpa, &jar, d, cookie_file.?, now);
 
@@ -65,6 +85,7 @@ fn run(init: std.process.Init) !void {
     else
         &start_seed;
 
+    termmod.setOverride(init.environ_map.get("COLUMNS"), init.environ_map.get("LINES"));
     var term = terminalSize(io, std.Io.File.stdout());
     const truecolor = detectTruecolor(init.environ_map);
 
@@ -87,7 +108,9 @@ fn run(init: std.process.Init) !void {
         defer body.deinit();
         var status: u16 = 200;
         if (std.mem.eql(u8, nav.url, start_url)) {
-            try buildStartHtml(arena, bookmarks, &body.writer);
+            try buildStartHtml(arena, bookmarks, &body.writer, .{ policy.rules.items.len, css_policy.rules.items.len, fetch_policy.rules.items.len });
+        } else if (std.mem.eql(u8, nav.url, viewer.help_url)) {
+            try body.writer.writeAll(help_html);
         } else if (blk: {
             showStage(ui, " loading  {s}", .{nav.url});
             break :blk fetch(io, &client, &jar, arena, nav, &body, now, false);
@@ -116,7 +139,7 @@ fn run(init: std.process.Init) !void {
         showStage(ui, " parsing  {d} KB", .{body.writer.buffered().len / 1024});
         var doc = try html.parse(gpa, body.writer.buffered());
         defer doc.deinit();
-        const sheets = fetchLinkedCss(io, &client, &jar, doc.alloc(), nav.url, doc.root, now, ui);
+        const sheets = fetchLinkedCss(io, &client, &jar, doc.alloc(), nav.url, doc.root, now, ui, &fetch_policy);
         showStage(ui, " styling  {d} sheet{s}", .{ sheets.len, if (sheets.len == 1) "" else "s" });
         try cascade.apply(doc.alloc(), &doc, hostPath(nav.url).host, &css_policy, sheets);
         try forms.init(doc.alloc(), doc.root);
@@ -124,7 +147,7 @@ fn run(init: std.process.Init) !void {
 
         if (!term.tty) {
             const pg = try layout.layout(scratch.allocator(), &doc, term.cols);
-            const frame = try render.render(scratch.allocator(), pg.root, false, truecolor);
+            const frame = try render.render(scratch.allocator(), pg.root, false, truecolor, &theme);
             try std.Io.File.stdout().writeStreamingAll(io, frame);
             var b: [128]u8 = undefined;
             eprint(io, std.fmt.bufPrint(&b, "\n[status {d}] {s}\n", .{ status, doc.title }) catch "\n");
@@ -136,9 +159,9 @@ fn run(init: std.process.Init) !void {
             _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
             const pg = try layout.layout(sa, &doc, term.cols);
-            const frame = try render.render(sa, pg.root, true, truecolor);
+            const frame = try render.render(sa, pg.root, true, truecolor, &theme);
             var b: [512]u8 = undefined;
-            const bar = std.fmt.bufPrint(&b, " slyph  {s}  [{d}] {s}  ({d}L {d}F)  f·i·r·^L·H·L·q", .{ nav.url, status, doc.title, pg.links.len, pg.fields.len }) catch " slyph";
+            const bar = std.fmt.bufPrint(&b, " slyph  {s}  [{d}] {s}  ({d}L {d}F)  ?·f·i·^L·H·L·q", .{ nav.url, status, doc.title, pg.links.len, pg.fields.len }) catch " slyph";
 
             switch (try viewer.view(gpa, io, frame, pg.links, pg.fields, term.cols, term.rows, bar, &scroll)) {
                 .quit => return,
@@ -288,37 +311,65 @@ fn fetch(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, arena: std.mem
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    _ = reader.streamRemaining(&body.writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
-        else => |e| return e,
-    };
+    var left: usize = max_body;
+    while (left > 0) {
+        left -= reader.stream(&body.writer, .limited(left)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return response.bodyErr().?,
+            else => |e| return e,
+        };
+    }
     return .{ .status = status, .location = location };
 }
 
 const max_sheets = 16;
+const max_body = 32 << 20;
 
-fn fetchLinkedCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, root: *dom.Node, now: i64, ui: ?Ui) []const []const u8 {
+fn fetchLinkedCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, root: *dom.Node, now: i64, ui: ?Ui, policy: *const cookies.Policy) []const []const u8 {
     var sheets: std.ArrayList([]const u8) = .empty;
     var count: usize = 0;
-    collectCss(io, client, jar, da, base, root, now, &sheets, &count, ui);
+    collectCss(io, client, jar, da, base, root, now, &sheets, &count, ui, policy);
     return sheets.toOwnedSlice(da) catch &.{};
 }
 
-fn collectCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, node: *dom.Node, now: i64, sheets: *std.ArrayList([]const u8), count: *usize, ui: ?Ui) void {
+fn collectCss(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, node: *dom.Node, now: i64, sheets: *std.ArrayList([]const u8), count: *usize, ui: ?Ui, policy: *const cookies.Policy) void {
     if (count.* >= max_sheets) return;
     if (node.kind == .element and std.ascii.eqlIgnoreCase(node.tag, "link") and isStylesheet(node)) {
         if (node.attr("href")) |href| {
             if (resolveUrl(da, base, href)) |url| {
-                showStage(ui, " stylesheet {d}/{d}  {s}", .{ count.* + 1, max_sheets, url });
-                if (fetchCssOne(io, client, jar, da, url, now)) |text| {
-                    sheets.append(da, text) catch {};
-                    count.* += 1;
+                if (!fetchDenied(policy, base, url, "css")) {
+                    showStage(ui, " stylesheet {d}/{d}  {s}", .{ count.* + 1, max_sheets, url });
+                    if (fetchCssOne(io, client, jar, da, base, url, now, policy)) |text| {
+                        sheets.append(da, text) catch {};
+                        count.* += 1;
+                    }
                 }
             } else |_| {}
         }
     }
     var child = node.first_child;
-    while (child) |c| : (child = c.next_sibling) collectCss(io, client, jar, da, base, c, now, sheets, count, ui);
+    while (child) |c| : (child = c.next_sibling) collectCss(io, client, jar, da, base, c, now, sheets, count, ui, policy);
+}
+
+fn fetchDenied(policy: *const cookies.Policy, page_url: []const u8, res_url: []const u8, kind: []const u8) bool {
+    const page = hostPath(page_url).host;
+    const res = hostPath(res_url);
+    if (policy.denied(page, res.host)) return true;
+    if (policy.denied(page, res.path)) return true;
+    if (policy.denied(page, kind)) return true;
+    if (!sameSite(page, res.host) and policy.denied(page, "third-party")) return true;
+    return false;
+}
+
+fn sameSite(a: []const u8, b: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(a, b)) return true;
+    return std.ascii.eqlIgnoreCase(registrable(a), registrable(b));
+}
+
+fn registrable(host: []const u8) []const u8 {
+    var dot = std.mem.lastIndexOfScalar(u8, host, '.') orelse return host;
+    dot = std.mem.lastIndexOfScalar(u8, host[0..dot], '.') orelse return host;
+    return host[dot + 1 ..];
 }
 
 fn isStylesheet(node: *dom.Node) bool {
@@ -328,7 +379,7 @@ fn isStylesheet(node: *dom.Node) bool {
     return false;
 }
 
-fn fetchCssOne(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, url: []const u8, now: i64) ?[]const u8 {
+fn fetchCssOne(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.mem.Allocator, base: []const u8, url: []const u8, now: i64, policy: *const cookies.Policy) ?[]const u8 {
     var u = url;
     var hops: u8 = 0;
     while (hops < 5) : (hops += 1) {
@@ -337,6 +388,7 @@ fn fetchCssOne(io: std.Io, client: *std.http.Client, jar: *cookies.Jar, da: std.
         if (res.status >= 300 and res.status < 400) {
             const loc = res.location orelse return null;
             u = resolveUrl(da, u, loc) catch return null;
+            if (fetchDenied(policy, base, u, "css")) return null;
             continue;
         }
         if (res.status != 200) return null;
@@ -388,6 +440,45 @@ const default_cookie_policy =
     \\
 ;
 
+const default_fetch_policy =
+    \\# ~/.slyph/fetch.policy
+    \\# The earliest interception point: a denied sub-resource is never requested at all.
+    \\# The page itself is always fetched — this gates only what the page asks slyph to pull.
+    \\# Syntax:  deny <page-domain-glob> <what-glob>
+    \\#   page-domain-glob: exact (example.com), suffix (*.example.com), or any (*)
+    \\#   what-glob matches, in turn, the sub-resource's:
+    \\#     host      (*.doubleclick.net, fonts.googleapis.com)
+    \\#     path      (/analytics.js, /wp-content/*)
+    \\#     kind      (css)
+    \\#     the literal word `third-party` when its site differs from the page's
+    \\# Edit freely; delete the file to reset.
+    \\
+    \\# --- known analytics / ad / tag hosts (denied by default) ---
+    \\deny * *.doubleclick.net
+    \\deny * *.google-analytics.com
+    \\deny * *.googletagmanager.com
+    \\deny * *.googlesyndication.com
+    \\deny * *.scorecardresearch.com
+    \\deny * *.hotjar.com
+    \\deny * *.segment.io
+    \\deny * *.segment.com
+    \\deny * *.mixpanel.com
+    \\deny * *.amplitude.com
+    \\deny * *.newrelic.com
+    \\deny * *.branch.io
+    \\deny * *.adsrvr.org
+    \\deny * *.criteo.com
+    \\deny * *.taboola.com
+    \\deny * *.outbrain.com
+    \\
+    \\# --- aggressive options (commented; uncomment to opt in) ---
+    \\# deny * third-party        # pull nothing from another site — fast, sometimes ugly
+    \\# deny * *.googleapis.com   # web fonts and hosted libs
+    \\# deny * *.cloudflare.com
+    \\# deny * css                # skip every linked stylesheet, keep inline <style>
+    \\
+;
+
 const default_css_policy =
     \\# ~/.slyph/css.policy
     \\# The site styles the page; you decide which of its styles slyph obeys.
@@ -431,10 +522,24 @@ fn saveCookies(io: std.Io, gpa: std.mem.Allocator, jar: *cookies.Jar, dir: []con
     jar.serialize(now, &buf.writer) catch return;
     if (buf.writer.buffered().len == 0) return;
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = buf.writer.buffered() }) catch {};
+    writeFileAtomic(io, gpa, file, buf.writer.buffered());
 }
 
-fn buildSubmit(arena: std.mem.Allocator, base: []const u8, submit: *@import("dom/node.zig").Node) !Nav {
+fn writeFileAtomic(io: std.Io, gpa: std.mem.Allocator, file: []const u8, data: []const u8) void {
+    const tmp = std.fmt.allocPrint(gpa, "{s}.tmp", .{file}) catch {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = data }) catch {};
+        return;
+    };
+    defer gpa.free(tmp);
+    const cwd = std.Io.Dir.cwd();
+    cwd.writeFile(io, .{ .sub_path = tmp, .data = data }) catch return;
+    cwd.rename(tmp, cwd, file, io) catch {
+        cwd.writeFile(io, .{ .sub_path = file, .data = data }) catch {};
+        cwd.deleteFile(io, tmp) catch {};
+    };
+}
+
+fn buildSubmit(arena: std.mem.Allocator, base: []const u8, submit: *dom.Node) !Nav {
     const form = forms.formFor(submit) orelse return .{ .url = base };
     const action = try resolveUrl(arena, base, form.attr("action") orelse "");
     const encoded = try forms.encode(arena, form, submit);
@@ -466,14 +571,12 @@ const start_html_head =
     \\ .rule { color: #3a3a3a }
     \\ a { color: #ffaf5f }
     \\ .hint { color: #6a6a6a }
+    \\ .tag { color: #6a6a6a }
+    \\ th { color: #5fd7ff }
     \\</style>
-    \\<pre class=banner>▞▚ S L Y P H ▞▚</pre>
-    \\<pre class=rule>════════════════════════════</pre>
+    \\<pre class=banner>  ▞▚ S L Y P H ▞▚</pre>
+    \\<pre class=tag>  a terminal browser that obeys you, not the page</pre>
     \\
-;
-const start_html_foot =
-    \\<pre class=rule>════════════════════════════</pre>
-    \\<pre class=hint>^L url · f follow · r reload · H back · L fwd · q quit</pre>
 ;
 
 fn loadStart(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, dir: []const u8, file: []const u8) ![]const Bookmark {
@@ -492,10 +595,8 @@ fn loadStart(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, dir: 
 
 fn parseStart(arena: std.mem.Allocator, bytes: []const u8) ![]const Bookmark {
     var list: std.ArrayList(Bookmark) = .empty;
-    var it = std.mem.splitScalar(u8, bytes, '\n');
+    var it = util.lines(bytes);
     while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \r\t");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
         const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
         const name = std.mem.trim(u8, line[0..tab], " \r");
         const url = std.mem.trim(u8, line[tab + 1 ..], " \r");
@@ -505,14 +606,61 @@ fn parseStart(arena: std.mem.Allocator, bytes: []const u8) ![]const Bookmark {
     return list.toOwnedSlice(arena);
 }
 
-fn buildStartHtml(arena: std.mem.Allocator, bookmarks: []const Bookmark, w: *std.Io.Writer) !void {
+fn buildStartHtml(arena: std.mem.Allocator, bookmarks: []const Bookmark, w: *std.Io.Writer, denied: [3]usize) !void {
     try w.writeAll(start_html_head);
+    try w.writeAll("<table border=1><tr><th>go</th><th>where</th></tr>");
     for (bookmarks) |b| {
         const href = try absoluteUrl(arena, b.url);
-        try w.print("<div><a href=\"{s}\">{s}</a></div>", .{ href, b.name });
+        try w.print("<tr><td><a href=\"{s}\">{s}</a></td><td class=tag>{s}</td></tr>", .{ href, b.name, hostPath(href).host });
     }
-    try w.writeAll(start_html_foot);
+    try w.writeAll("</table>");
+    try w.print(
+        \\<pre class=tag>standing orders — {d} cookie rules · {d} style rules · {d} fetch rules
+        \\edit them in ~/.slyph/, they are yours</pre>
+        \\<pre class=hint>? keys · ^L url · f follow · i field · H back · q quit</pre>
+    , .{ denied[0], denied[1], denied[2] });
 }
+
+const help_html =
+    \\<style>
+    \\ .banner { color: #5fd7ff; font-weight: bold }
+    \\ .rule { color: #3a3a3a }
+    \\ th { color: #5fd7ff }
+    \\ .k { color: #ffaf5f }
+    \\ .note { color: #6a6a6a }
+    \\</style>
+    \\<pre class=banner>▞▚ S L Y P H ▞▚  keys</pre>
+    \\<pre class=rule>════════════════════════════════════════════</pre>
+    \\<table>
+    \\<tr><th>key</th><th>does</th></tr>
+    \\<tr><td class=k>j k</td><td>scroll a line (arrows work too)</td></tr>
+    \\<tr><td class=k>d u</td><td>half a page down / up (space, b too)</td></tr>
+    \\<tr><td class=k>PgDn PgUp</td><td>a whole page</td></tr>
+    \\<tr><td class=k>g G</td><td>top / bottom (Home, End too)</td></tr>
+    \\<tr><td class=k>f</td><td>follow a link — type the [n] beside it</td></tr>
+    \\<tr><td class=k>i</td><td>use a field — type the {n} beside it, then the text</td></tr>
+    \\<tr><td class=k>r</td><td>reload</td></tr>
+    \\<tr><td class=k>^L or :</td><td>url bar</td></tr>
+    \\<tr><td class=k>H L</td><td>back / forward</td></tr>
+    \\<tr><td class=k>?</td><td>this page</td></tr>
+    \\<tr><td class=k>q</td><td>quit, after a y/n check</td></tr>
+    \\<tr><td class=k>Q</td><td>quit at once, no check</td></tr>
+    \\</table>
+    \\<pre class=rule>════════════════════════════════════════════</pre>
+    \\<pre class=note>[n] is a link, {n} is a form field. Both are typed as plain numbers.
+    \\A checkbox or radio toggles with i; a submit button submits with i.</pre>
+    \\<pre class=rule>════════════════════════════════════════════</pre>
+    \\<pre class=note>Config lives in ~/.slyph/ — each file is plain text you can edit:
+    \\  start          your start-page links
+    \\  theme          colors, by role
+    \\  cookies.txt    saved cookies
+    \\  cookies.policy which cookies are allowed
+    \\  css.policy     which site styles are obeyed
+    \\  fetch.policy   which sub-resources are fetched at all
+    \\
+    \\LINES / COLUMNS override the terminal size slyph draws to.
+    \\Press H to go back.</pre>
+;
 
 fn buildErrorHtml(url: []const u8, err: anyerror, w: *std.Io.Writer) !void {
     const note: []const u8 = if (err == error.TlsInitializationFailed)
@@ -563,7 +711,7 @@ fn print(io: std.Io, msg: []const u8) void {
     std.Io.File.stdout().writeStreamingAll(io, msg) catch {};
 }
 
-const version = "0.1.3";
+const version = "0.1.4";
 
 const help_text =
     \\slyph — terminal web browser (pure zig, own engine)
@@ -576,9 +724,13 @@ const help_text =
     \\keys:
     \\  j/k or arrows scroll   d/u half-page   PgUp/PgDn page   g/G top/bottom
     \\  f follow link    i edit/activate field    r reload
-    \\  ^L or :  url bar     H back     L forward     q quit
+    \\  ^L or :  url bar   H back   L forward   ? keys   q quit (Q now)
     \\
-    \\config in ~/.slyph/ : start, cookies.txt, cookies.policy, css.policy
+    \\LINES / COLUMNS override the detected terminal size (useful when an
+    \\on-screen keyboard covers part of the screen, e.g. under ish on ios)
+    \\
+    \\config in ~/.slyph/ : start, theme, cookies.txt,
+    \\                     cookies.policy, css.policy, fetch.policy
     \\
 ;
 
@@ -588,23 +740,63 @@ fn detectTruecolor(env: anytype) bool {
 }
 
 fn terminalSize(io: std.Io, file: std.Io.File) Term {
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const r = io.operate(.{ .device_io_control = .{
-        .file = file,
-        .code = std.posix.T.IOCGWINSZ,
-        .arg = &ws,
-    } }) catch return .{ .cols = 80, .rows = 24, .tty = false };
-    if (r.device_io_control >= 0 and ws.col > 0) return .{ .cols = ws.col, .rows = ws.row, .tty = true };
-    return .{ .cols = 80, .rows = 24, .tty = false };
+    const sz = termmod.size(io, file);
+    return .{ .cols = sz.cols, .rows = sz.rows, .tty = sz.tty };
 }
 
-fn findSubmit(node: *@import("dom/node.zig").Node) ?*@import("dom/node.zig").Node {
+fn findSubmit(node: *dom.Node) ?*dom.Node {
     if (node.kind == .element and forms.kind(node) == .submit) return node;
     var c = node.first_child;
     while (c) |n| : (c = n.next_sibling) {
         if (findSubmit(n)) |s| return s;
     }
     return null;
+}
+
+test "registrable domain and same-site comparison" {
+    try std.testing.expectEqualStrings("example.com", registrable("a.b.example.com"));
+    try std.testing.expectEqualStrings("example.com", registrable("example.com"));
+    try std.testing.expectEqualStrings("localhost", registrable("localhost"));
+    try std.testing.expect(sameSite("example.com", "cdn.example.com"));
+    try std.testing.expect(sameSite("a.example.com", "b.example.com"));
+    try std.testing.expect(!sameSite("example.com", "doubleclick.net"));
+}
+
+test "fetch policy gates sub-resources by host, path, kind and third-party" {
+    var p: cookies.Policy = .init(std.testing.allocator);
+    defer p.deinit();
+    try p.loadDenyLines(
+        \\deny * *.google-analytics.com
+        \\deny shop.example.com /track/*
+        \\deny noskin.example.com css
+        \\deny strict.example.com third-party
+    );
+
+    const page = "https://shop.example.com/a";
+    try std.testing.expect(p.denied("shop.example.com", "www.google-analytics.com"));
+    try std.testing.expect(fetchDenied(&p, page, "https://www.google-analytics.com/x.css", "css"));
+    try std.testing.expect(fetchDenied(&p, page, "https://shop.example.com/track/a.css", "css"));
+    try std.testing.expect(!fetchDenied(&p, page, "https://shop.example.com/site.css", "css"));
+    try std.testing.expect(!fetchDenied(&p, page, "https://cdn.example.com/site.css", "css"));
+
+    try std.testing.expect(fetchDenied(&p, "https://noskin.example.com/a", "https://noskin.example.com/s.css", "css"));
+
+    const strict = "https://strict.example.com/a";
+    try std.testing.expect(fetchDenied(&p, strict, "https://cdn.other.net/s.css", "css"));
+    try std.testing.expect(!fetchDenied(&p, strict, "https://cdn.example.com/s.css", "css"));
+}
+
+test "seeded fetch policy denies known trackers, leaves ordinary hosts alone" {
+    var p: cookies.Policy = .init(std.testing.allocator);
+    defer p.deinit();
+    try p.loadDenyLines(default_fetch_policy);
+
+    const page = "https://news.example.com/a";
+    try std.testing.expect(fetchDenied(&p, page, "https://www.googletagmanager.com/gtm.js", "css"));
+    try std.testing.expect(fetchDenied(&p, page, "https://static.doubleclick.net/a.css", "css"));
+    try std.testing.expect(!fetchDenied(&p, page, "https://fonts.googleapis.com/css?family=x", "css"));
+    try std.testing.expect(!fetchDenied(&p, page, "https://news.example.com/site.css", "css"));
+    try std.testing.expect(!fetchDenied(&p, page, "https://cdn.jsdelivr.net/x.css", "css"));
 }
 
 test "buildSubmit makes GET query and POST body" {
@@ -653,7 +845,9 @@ test {
     _ = @import("layout/box.zig");
     _ = @import("layout/engine.zig");
     _ = @import("render/text.zig");
+    _ = @import("render/theme.zig");
     _ = @import("forms/forms.zig");
     _ = @import("session/cookies.zig");
     _ = @import("tui/viewer.zig");
+    _ = @import("tui/term.zig");
 }

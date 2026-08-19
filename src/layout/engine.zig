@@ -93,7 +93,7 @@ fn layoutContainer(
             if (seen_content) y += @max(prev_margin_bottom, mt);
             if (disp == .list_item) list_index += 1;
             const child_marker: ?Marker = if (disp == .list_item and cs != null)
-                .{ .text = try markerText(ctx, node, list_index), .cs = cs.? }
+                .{ .text = try markerText(ctx, node, list_index), .cs = try markerStyle(ctx, cs.?) }
             else
                 null;
             const ind: u16 = if (cs) |s| s.indent else 0;
@@ -120,6 +120,20 @@ fn markerText(ctx: *Ctx, parent: *dom.Node, index: u16) ![]const u8 {
     if (parent.kind == .element and std.mem.eql(u8, parent.tag, "ol"))
         return std.fmt.allocPrint(ctx.a, "{d}.", .{index + startOf(parent) - 1});
     return "\u{2022}";
+}
+
+fn markerStyle(ctx: *Ctx, cs: *const ComputedStyle) !*const ComputedStyle {
+    const inherited_default = switch (cs.color) {
+        .role => |r| r == .text,
+        .default => true,
+        .rgb => false,
+    };
+    if (!inherited_default) return cs;
+    const ms = try ctx.a.create(ComputedStyle);
+    ms.* = cs.*;
+    ms.color = .{ .role = .marker };
+    ms.color_role = .marker;
+    return ms;
 }
 
 fn startOf(list: *dom.Node) u16 {
@@ -253,14 +267,25 @@ fn layoutTable(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, start_y: u16, o
         }
     }
 
-    const widths = try ctx.a.alloc(u16, ncols);
-    distribute(col_min, col_max, avail_w, widths);
+    const bordered = tableBordered(node);
+    const frame: u16 = if (bordered) 2 else 0;
 
-    for (rows.items, grid.items) |tr, cells| {
+    const widths = try ctx.a.alloc(u16, ncols);
+    distribute(col_min, col_max, avail_w -| frame, widths);
+
+    const inner_w = tableInnerWidth(widths);
+    const cell_x0 = x + @as(u16, if (bordered) 1 else 0);
+
+    for (rows.items, grid.items, 0..) |tr, cells, ri| {
+        if (bordered) {
+            const kind: RuleKind = if (ri == 0) .top else .mid;
+            try out.append(ctx.a, try hRuleBox(ctx, node, x, y, widths, inner_w, kind));
+            y += 1;
+        }
         var row_kids: std.ArrayList(Box) = .empty;
         var row_end = y;
         for (cells) |cell| {
-            const cx = x + colOffset(widths, cell.col);
+            const cx = cell_x0 + colOffset(widths, cell.col);
             const cw = spanWidth(widths, cell.col, cell.span);
             var kids: std.ArrayList(Box) = .empty;
             const cell_end = try layoutContainer(ctx, cell.node, cx, cw, y, null, &kids);
@@ -273,6 +298,10 @@ fn layoutTable(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, start_y: u16, o
             });
             row_end = @max(row_end, cell_end);
         }
+        if (bordered) {
+            if (row_end == y) row_end = y + 1;
+            try vRuleBoxes(ctx, node, x, y, row_end, widths, inner_w, cells, &row_kids);
+        }
         try out.append(ctx.a, .{
             .kind = .block,
             .rect = .{ .x = x, .y = y, .w = avail_w, .h = row_end - y },
@@ -282,7 +311,104 @@ fn layoutTable(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, start_y: u16, o
         });
         y = row_end;
     }
+    if (bordered) {
+        try out.append(ctx.a, try hRuleBox(ctx, node, x, y, widths, inner_w, .bottom));
+        y += 1;
+    }
     return y;
+}
+
+fn tableBordered(node: *dom.Node) bool {
+    if (node.computed) |cs| {
+        if (cs.border) |b| return b;
+    }
+    const raw = node.attr("border") orelse return false;
+    const t = std.mem.trim(u8, raw, " \t");
+    if (t.len == 0) return true;
+    const n = std.fmt.parseInt(u32, t, 10) catch return true;
+    return n > 0;
+}
+
+fn tableInnerWidth(widths: []const u16) u16 {
+    var total: u32 = @as(u32, @intCast(widths.len -| 1)) * gutter;
+    for (widths) |w| total += w;
+    return @intCast(@min(total, std.math.maxInt(u16)));
+}
+
+const RuleKind = enum { top, mid, bottom };
+
+fn isBoundary(widths: []const u16, i: u16) bool {
+    var off: u32 = 0;
+    for (widths[0 .. widths.len - 1]) |w| {
+        off += w;
+        if (off == i) return true;
+        off += gutter;
+    }
+    return false;
+}
+
+fn hRuleBox(ctx: *Ctx, node: *dom.Node, x: u16, y: u16, widths: []const u16, inner_w: u16, kind: RuleKind) !Box {
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(ctx.a, switch (kind) {
+        .top => "\u{250c}",
+        .mid => "\u{251c}",
+        .bottom => "\u{2514}",
+    });
+    var i: u16 = 0;
+    while (i < inner_w) : (i += 1) {
+        try text.appendSlice(ctx.a, if (isBoundary(widths, i)) switch (kind) {
+            .top => "\u{252c}",
+            .mid => "\u{253c}",
+            .bottom => "\u{2534}",
+        } else "\u{2500}");
+    }
+    try text.appendSlice(ctx.a, switch (kind) {
+        .top => "\u{2510}",
+        .mid => "\u{2524}",
+        .bottom => "\u{2518}",
+    });
+    const w = inner_w + 2;
+    return .{
+        .kind = .text,
+        .rect = .{ .x = x, .y = y, .w = w, .h = 1 },
+        .node = node,
+        .style = node.computed,
+        .text = try text.toOwnedSlice(ctx.a),
+    };
+}
+
+fn vRuleBoxes(ctx: *Ctx, node: *dom.Node, x: u16, y: u16, end_y: u16, widths: []const u16, inner_w: u16, cells: []const Cell, out: *std.ArrayList(Box)) !void {
+    const right = inner_w + 1;
+    var i: u16 = 0;
+    while (i <= right) : (i += 1) {
+        if (i != 0 and i != right and !isBoundary(widths, i - 1)) continue;
+        if (i != 0 and i != right and spansBoundary(widths, cells, i - 1)) continue;
+        var row = y;
+        while (row < end_y) : (row += 1) {
+            try out.append(ctx.a, .{
+                .kind = .text,
+                .rect = .{ .x = x + i, .y = row, .w = 1, .h = 1 },
+                .node = node,
+                .style = node.computed,
+                .text = "\u{2502}",
+            });
+        }
+    }
+}
+
+fn spansBoundary(widths: []const u16, cells: []const Cell, i: u16) bool {
+    for (cells) |cell| {
+        if (cell.span <= 1) continue;
+        const last = @min(@as(usize, cell.col) + cell.span, widths.len);
+        var c: u16 = cell.col;
+        while (c + 1 < last) : (c += 1) {
+            var off: u32 = 0;
+            for (widths[0 .. c + 1]) |w| off += w;
+            off += @as(u32, c) * gutter;
+            if (off == i) return true;
+        }
+    }
+    return false;
 }
 
 fn layoutTableCaptions(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, start_y: u16, out: *std.ArrayList(Box)) std.mem.Allocator.Error!u16 {
@@ -425,32 +551,93 @@ fn estimateWidth(a: std.mem.Allocator, node: *dom.Node, w: u16) u16 {
     return @intCast(widest);
 }
 
-fn layoutPre(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, start_y: u16, out: *std.ArrayList(Box)) !u16 {
-    var text: std.ArrayList(u8) = .empty;
-    node.appendText(ctx.a, &text) catch {};
-    const cs = node.computed;
+const PreSeg = struct { text: []const u8, cs: ?*const ComputedStyle, link: u16 };
 
+fn layoutPre(ctx: *Ctx, node: *dom.Node, x: u16, avail_w: u16, start_y: u16, out: *std.ArrayList(Box)) !u16 {
+    var segs: std.ArrayList(PreSeg) = .empty;
+    defer segs.deinit(ctx.a);
+    var child = node.first_child;
+    while (child) |c| : (child = c.next_sibling) collectPre(ctx, c, 0, &segs) catch {};
+
+    const width = @max(avail_w, 1);
     var y = start_y;
-    var it = std.mem.splitScalar(u8, text.items, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        var kids: std.ArrayList(Box) = .empty;
-        const w: u16 = @intCast(@min(boxmod.cellWidth(line), avail_w));
-        try kids.append(ctx.a, .{
-            .kind = .text,
-            .rect = .{ .x = x, .y = y, .w = w, .h = 1 },
-            .style = cs,
-            .text = line,
-        });
-        try out.append(ctx.a, .{
-            .kind = .line,
-            .rect = .{ .x = x, .y = y, .w = w, .h = 1 },
-            .node = node,
-            .children = try kids.toOwnedSlice(ctx.a),
-        });
+    var line: std.ArrayList(Box) = .empty;
+    var cx: u16 = x;
+    var pending_line = false;
+
+    for (segs.items) |seg| {
+        var it = std.mem.splitScalar(u8, seg.text, '\n');
+        var first = true;
+        while (it.next()) |piece| {
+            if (!first) {
+                try emitPreLine(ctx, &line, node, x, cx, y, out);
+                y += 1;
+                cx = x;
+            }
+            first = false;
+            pending_line = true;
+            const text = std.mem.trimEnd(u8, piece, "\r");
+            if (text.len == 0) continue;
+            const room = if (cx >= x + width) 0 else x + width - cx;
+            if (room == 0) continue;
+            const w: u16 = @intCast(@min(boxmod.cellWidth(text), room));
+            try line.append(ctx.a, .{
+                .kind = .text,
+                .rect = .{ .x = cx, .y = y, .w = w, .h = 1 },
+                .node = node,
+                .style = seg.cs,
+                .text = text,
+                .link = seg.link,
+            });
+            cx += w;
+        }
+    }
+    if (pending_line) {
+        try emitPreLine(ctx, &line, node, x, cx, y, out);
         y += 1;
     }
+    line.deinit(ctx.a);
     return y;
+}
+
+fn emitPreLine(ctx: *Ctx, line: *std.ArrayList(Box), node: *dom.Node, x: u16, cx: u16, y: u16, out: *std.ArrayList(Box)) !void {
+    try out.append(ctx.a, .{
+        .kind = .line,
+        .rect = .{ .x = x, .y = y, .w = cx - x, .h = 1 },
+        .node = node,
+        .children = try line.toOwnedSlice(ctx.a),
+    });
+}
+
+fn collectPre(ctx: *Ctx, node: *dom.Node, link: u16, out: *std.ArrayList(PreSeg)) std.mem.Allocator.Error!void {
+    switch (node.kind) {
+        .text => {
+            const cs = node.computed orelse return;
+            try out.append(ctx.a, .{ .text = node.text, .cs = cs, .link = link });
+        },
+        .element => {
+            const cs = node.computed;
+            if (cs != null and cs.?.display == .none) return;
+            if (std.mem.eql(u8, node.tag, "br")) {
+                try out.append(ctx.a, .{ .text = "\n", .cs = cs, .link = link });
+                return;
+            }
+            var cur = link;
+            if (std.mem.eql(u8, node.tag, "a")) {
+                if (node.attr("href")) |href| {
+                    try ctx.links.append(ctx.a, href);
+                    cur = @intCast(ctx.links.items.len);
+                    if (cs) |st| {
+                        const hint = try std.fmt.allocPrint(ctx.a, "[{d}]", .{cur});
+                        try out.append(ctx.a, .{ .text = hint, .cs = st, .link = cur });
+                    }
+                }
+            }
+            var child = node.first_child;
+            while (child) |c| : (child = c.next_sibling) try collectPre(ctx, c, cur, out);
+        },
+        else => {},
+    }
 }
 
 fn collectInline(ctx: *Ctx, node: *dom.Node, link: u16, out: *std.ArrayList(Word)) !void {

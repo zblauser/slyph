@@ -1,5 +1,6 @@
 const std = @import("std");
-const posix = std.posix;
+const term = @import("term.zig");
+const safeByte = @import("../util.zig").safeByte;
 const engine = @import("../layout/engine.zig");
 const forms = @import("../forms/forms.zig");
 
@@ -44,13 +45,20 @@ pub fn view(
     while (true) {
         if (resized(io, cols, rows)) return .resize;
         try draw(gpa, io, out, &buf, lines.items, scroll.*, cols, page, bar);
-        const b = switch (pollByte(tick_ms)) {
+        const b = switch (term.pollByte(tick_ms)) {
             .byte => |c| c,
             .timeout => continue,
             .eof => break,
         };
         switch (b) {
-            'q' => return .quit,
+            'Q' => return .quit,
+            'q' => {
+                if (try promptText(gpa, io, out, &buf, cols, rows, "quit? y/n", "")) |a| {
+                    defer gpa.free(a);
+                    if (a.len > 0 and (a[0] == 'y' or a[0] == 'Y')) return .quit;
+                }
+            },
+            '?' => return .{ .navigate = try gpa.dupe(u8, help_url) },
             'H' => return .back,
             'L' => return .forward,
             'r' => return .reload,
@@ -61,12 +69,12 @@ pub fn view(
             'g' => scroll.* = 0,
             'G' => scroll.* = max_scroll,
             0x1b => {
-                const intro = switch (pollByte(esc_ms)) {
+                const intro = switch (term.pollByte(esc_ms)) {
                     .byte => |c| c,
                     else => continue,
                 };
                 if (intro != '[' and intro != 'O') continue;
-                const code = switch (pollByte(esc_ms)) {
+                const code = switch (term.pollByte(esc_ms)) {
                     .byte => |c| c,
                     else => continue,
                 };
@@ -76,11 +84,11 @@ pub fn view(
                     'H' => scroll.* = 0,
                     'F' => scroll.* = max_scroll,
                     '5' => {
-                        _ = pollByte(esc_ms);
+                        _ = term.pollByte(esc_ms);
                         scroll.* -|= page;
                     },
                     '6' => {
-                        _ = pollByte(esc_ms);
+                        _ = term.pollByte(esc_ms);
                         scroll.* = @min(scroll.* + page, max_scroll);
                     },
                     else => {},
@@ -156,11 +164,11 @@ fn statusBar(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8, 
     var w: u16 = 0;
     for (text) |c| {
         if (w >= left_max) break;
-        try buf.append(gpa, c);
+        try buf.append(gpa, safeByte(c));
         w += 1;
     }
     while (w < left_max) : (w += 1) try buf.append(gpa, ' ');
-    try buf.appendSlice(gpa, right[0..right_w]);
+    for (right[0..right_w]) |c| try buf.append(gpa, safeByte(c));
     try buf.appendSlice(gpa, "\x1b[0m");
 }
 
@@ -188,7 +196,7 @@ fn promptText(gpa: std.mem.Allocator, io: std.Io, out: std.Io.File, buf: *std.Ar
         try statusBar(gpa, buf, prompt.items, "", cols);
         try out.writeStreamingAll(io, buf.items);
 
-        switch (readByte() orelse return null) {
+        switch (term.readByte() orelse return null) {
             '\r', '\n' => return try text.toOwnedSlice(gpa),
             0x1b => return null,
             0x7f, 0x08 => if (text.items.len > 0) {
@@ -199,13 +207,15 @@ fn promptText(gpa: std.mem.Allocator, io: std.Io, out: std.Io.File, buf: *std.Ar
     }
 }
 
+pub const help_url = "about:help";
+
 const enter_ui = "\x1b[?1049h\x1b[?25l";
 const exit_ui = "\x1b[?25h\x1b[?1049l";
 
 const tick_ms: i32 = 100;
 const esc_ms: i32 = 50;
 
-var ui_termios: posix.termios = undefined;
+var ui_raw: term.Raw = undefined;
 
 pub fn progress(io: std.Io, cols: u16, rows: u16, text: []const u8) void {
     var buf: [1024]u8 = undefined;
@@ -220,7 +230,7 @@ fn progressBytes(buf: []u8, cols: u16, rows: u16, text: []const u8) []u8 {
     const width: usize = @min(@as(usize, cols), buf.len - n - tail.len);
     var w: usize = 0;
     while (w < width) : (w += 1) {
-        buf[n] = if (w < text.len) text[w] else ' ';
+        buf[n] = if (w < text.len) safeByte(text[w]) else ' ';
         n += 1;
     }
     @memcpy(buf[n..][0..tail.len], tail);
@@ -228,44 +238,16 @@ fn progressBytes(buf: []u8, cols: u16, rows: u16, text: []const u8) []u8 {
 }
 
 pub fn beginUi(io: std.Io) !void {
-    ui_termios = try enterRaw();
+    ui_raw = try term.enterRaw();
     try std.Io.File.stdout().writeStreamingAll(io, enter_ui);
 }
 
 pub fn endUi(io: std.Io) void {
     std.Io.File.stdout().writeStreamingAll(io, exit_ui) catch {};
-    restore(ui_termios);
+    term.restore(ui_raw);
 }
 
-fn enterRaw() !posix.termios {
-    const saved = try posix.tcgetattr(posix.STDIN_FILENO);
-    var raw = saved;
-    raw.lflag.ECHO = false;
-    raw.lflag.ICANON = false;
-    try posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, raw);
-    return saved;
-}
-
-fn restore(saved: posix.termios) void {
-    posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, saved) catch {};
-}
-
-const Poll = union(enum) { byte: u8, timeout, eof };
-
-fn pollByte(timeout_ms: i32) Poll {
-    var fds = [_]posix.pollfd{.{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 }};
-    const n = posix.poll(&fds, timeout_ms) catch return .eof;
-    if (n == 0) return .timeout;
-    var b: [1]u8 = undefined;
-    const r = posix.read(posix.STDIN_FILENO, &b) catch return .eof;
-    return if (r == 0) .eof else .{ .byte = b[0] };
-}
-
-fn readByte() ?u8 {
-    var b: [1]u8 = undefined;
-    const n = posix.read(posix.STDIN_FILENO, &b) catch return null;
-    return if (n == 0) null else b[0];
-}
+const Poll = term.Poll;
 
 fn resized(io: std.Io, cols: u16, rows: u16) bool {
     const sz = currentSize(io) orelse return false;
@@ -273,14 +255,8 @@ fn resized(io: std.Io, cols: u16, rows: u16) bool {
 }
 
 fn currentSize(io: std.Io) ?[2]u16 {
-    var ws: posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const r = io.operate(.{ .device_io_control = .{
-        .file = std.Io.File.stdout(),
-        .code = posix.T.IOCGWINSZ,
-        .arg = &ws,
-    } }) catch return null;
-    if (r.device_io_control >= 0 and ws.col > 0) return .{ ws.col, ws.row };
-    return null;
+    const sz = term.size(io, std.Io.File.stdout());
+    return if (sz.tty) .{ sz.cols, sz.rows } else null;
 }
 
 test "progress line targets the last row, pads to width, resets sgr" {

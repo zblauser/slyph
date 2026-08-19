@@ -13,36 +13,53 @@ Hide
 Type "zig build" Enter
 Sleep 5s
 Type 'export PATH="$PWD/zig-out/bin:$PATH"' Enter
+Type 'export COLORTERM=truecolor' Enter
 Sleep 500ms
 Type "clear" Enter
 Show
 
-Type "slyph news.ycombinator.com"
+Type "slyph"
 Sleep 700ms
+Enter
+Sleep 3s
+
+Type "?"
+Sleep 3s
+Type "j"
+Sleep 700ms
+Type "j"
+Sleep 1500ms
+Type "H"
+Sleep 2s
+
+Type "f"
+Sleep 800ms
+Type "1"
+Sleep 500ms
+Enter
+Sleep 4s
+
+Type "j"
+Sleep 800ms
+Type "j"
+Sleep 800ms
+Type "j"
+Sleep 1500ms
+
+Ctrl+L
+Sleep 800ms
+Type "ziglang.org/learn/samples/"
+Sleep 600ms
 Enter
 Sleep 4s
 
 Type "j"
 Sleep 900ms
 Type "j"
-Sleep 900ms
-Type "j"
-Sleep 1500ms
-
-Ctrl+L
-Sleep 900ms
-Type "news.ycombinator.com/item?id=49117099"
-Sleep 600ms
-Enter
-Sleep 4500ms
-
-Type "j"
-Sleep 900ms
-Type "j"
 Sleep 1800ms
-
-Type "H"
-Sleep 2500ms
 
 Type "q"
 Sleep 1200ms
+Type "y"
+Enter
+Sleep 1500ms

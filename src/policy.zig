@@ -1,5 +1,6 @@
 const std = @import("std");
-const domainMatch = @import("util.zig").domainMatch;
+const util = @import("util.zig");
+const domainMatch = util.domainMatch;
 
 pub const DenyList = struct {
     alloc: std.mem.Allocator,
@@ -20,10 +21,8 @@ pub const DenyList = struct {
     }
 
     pub fn loadDenyLines(self: *DenyList, bytes: []const u8) !void {
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
-        while (lines.next()) |line| {
-            const t = std.mem.trim(u8, line, " \t\r");
-            if (t.len == 0 or t[0] == '#') continue;
+        var it = util.lines(bytes);
+        while (it.next()) |t| {
             var f = std.mem.tokenizeAny(u8, t, " \t");
             const verb = f.next() orelse continue;
             if (!std.mem.eql(u8, verb, "deny")) continue;

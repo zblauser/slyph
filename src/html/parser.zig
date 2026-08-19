@@ -44,12 +44,14 @@ pub fn parse(gpa: std.mem.Allocator, src: []const u8) !dom.Document {
                     continue;
                 }
                 if (st.self_closing or isVoid(st.name)) continue;
-                try stack.append(a, el);
+                if (stack.items.len < max_depth) try stack.append(a, el);
             },
         }
     }
     return doc;
 }
+
+const max_depth = 256;
 
 fn implyClose(stack: *std.ArrayList(*dom.Node), start: []const u8) void {
     while (stack.items.len > 1) {
@@ -212,4 +214,21 @@ test "stray end tag is ignored" {
     try std.testing.expectEqualStrings("p", p.tag);
     try std.testing.expectEqualStrings("a", p.first_child.?.text);
     try std.testing.expectEqualStrings("b", p.first_child.?.next_sibling.?.text);
+}
+
+test "runaway nesting is capped so later passes cannot overflow the stack" {
+    const a = std.testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "<html><body>");
+    for (0..5000) |_| try src.appendSlice(a, "<div>");
+    try src.appendSlice(a, "deep");
+
+    var doc = try parse(a, src.items);
+    defer doc.deinit();
+
+    var depth: usize = 0;
+    var n: ?*dom.Node = doc.root;
+    while (n) |cur| : (n = cur.first_child) depth += 1;
+    try std.testing.expect(depth <= max_depth + 2);
 }

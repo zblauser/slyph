@@ -33,6 +33,8 @@ jobs:
           - x86_64-macos
           - aarch64-macos
           - x86_64-freebsd
+          - x86_64-windows
+          - aarch64-windows
     steps:
       - uses: actions/checkout@v4
 
@@ -41,12 +43,19 @@ jobs:
           version: 0.16.0
 
       - name: build
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSmall -Dstrip=true --prefix out
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe -Dstrip=true --prefix out
 
       - name: package
         run: |
           install -d dist
-          tar -czf dist/slyph-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C out/bin slyph
+          case "${{ matrix.target }}" in
+            *windows*)
+              cd out/bin && zip -9 "$GITHUB_WORKSPACE/dist/slyph-${{ github.ref_name }}-${{ matrix.target }}.zip" slyph.exe
+              ;;
+            *)
+              tar -czf dist/slyph-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C out/bin slyph
+              ;;
+          esac
 
       - uses: actions/upload-artifact@v4
         with:

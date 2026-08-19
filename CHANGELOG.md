@@ -1,7 +1,37 @@
 # changelog
 
 all notable changes to slyph, newest first.<br>
-v0.x is early: the version numbers are build phases, not stability promises.
+
+## v0.1.4
++ **fetch deny policy** (`~/.slyph/fetch.policy`) - a denied sub-resource is never
+  requested. matches host, path, kind or `third-party`. seeded with tracker hosts
++ **security** - page text can no longer emit terminal escapes. a page could retitle
+  the terminal, forge ui with cursor moves, or overwrite the clipboard via OSC 52
++ **security** - dom depth is capped at parse time; ~60k nested elements used to segfault
++ **security** - releases build with runtime safety checks on (`ReleaseSafe`)
++ **security** - response bodies are capped at 32 mb, so a never-ending or
+  decompression-bomb response cannot exhaust memory
++ **security** - a redirected sub-resource is re-checked against `fetch.policy`, so a
+  denied host cannot be reached by bouncing through an allowed one
++ **themes** - colors resolve through roles (`text`, `background`, `link`, `heading`,
+  `marker`, `rule`), set in `~/.slyph/theme`. `roles-only` overrides site colors.
+  no theme file means no change
++ **background-color** - drawn only when it is a dark tint, or when a theme declares a
+  `background` and the color contrasts with it. sites assume a white canvas, so painting
+  them literally turned text into highlighter bars
++ **table borders** - box rules for tables that ask, via the `border` attribute or css
+  (css wins). layout-only tables stay rule-free
++ **`<pre>` keeps inline markup** - code blocks flattened to one unstyled run before,
+  which dropped every link inside them. links now get their `[n]` and syntax colors hold
++ **windows builds** - console backend behind a platform interface. all nine targets build
++ `?` opens a key reference, rendered through the engine so it scrolls and `H` backs
++ `q` asks before quitting; `Q` quits at once
++ start page lists bookmarks in a table with hosts and a count of standing deny rules
++ list markers take a `marker` role, colorable apart from item text
++ cookie writes are atomic, so a crash mid-save cannot truncate `cookies.txt`
++ `LINES` / `COLUMNS` override the detected terminal size, clamped, shrink-only on a tty
++ `border`, `border-style`, `border-width` parsed; `none` / `0` distinct from undeclared
++ `zig build clean` removes `zig-out` and the local cache
 
 ## v0.1.3
 + **table layout** - `display:table/row/cell`, colspan + rowspan, automatic column

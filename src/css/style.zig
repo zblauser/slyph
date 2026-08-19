@@ -22,9 +22,21 @@ pub const FontWeight = enum { normal, bold };
 pub const FontStyle = enum { normal, italic };
 pub const WhiteSpace = enum { normal, pre };
 
+pub const Rgb = struct { r: u8, g: u8, b: u8 };
+
+pub const Role = enum {
+    text,
+    background,
+    link,
+    heading,
+    marker,
+    rule,
+};
+
 pub const Color = union(enum) {
     default,
-    rgb: struct { r: u8, g: u8, b: u8 },
+    role: Role,
+    rgb: Rgb,
 };
 
 pub const Var = struct { name: []const u8, value: []const u8 };
@@ -35,7 +47,11 @@ pub const ComputedStyle = struct {
     font_weight: FontWeight = .normal,
     font_style: FontStyle = .normal,
     underline: bool = false,
+    border: ?bool = null,
     color: Color = .default,
+    color_role: Role = .text,
+    background: Color = .default,
+    background_role: Role = .background,
     margin_top: u8 = 0,
     margin_bottom: u8 = 0,
     indent: u8 = 0,
@@ -50,6 +66,9 @@ pub const ComputedStyle = struct {
             .font_style = parent.font_style,
             .underline = parent.underline,
             .color = parent.color,
+            .color_role = parent.color_role,
+            .background = parent.background,
+            .background_role = parent.background_role,
             .vars = parent.vars,
             .display = .inline_,
         };

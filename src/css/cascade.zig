@@ -1,5 +1,6 @@
 const std = @import("std");
 const eq = @import("../util.zig").eq;
+const hexRgb = @import("../util.zig").hexRgb;
 const dom = @import("../dom/node.zig");
 const style = @import("style.zig");
 const css = @import("parser.zig");
@@ -27,6 +28,10 @@ pub const ua_css =
     \\blockquote, dd { margin-left: 4 }
     \\ul ul, ul ol, ol ul, ol ol { margin-top: 0; margin-bottom: 0 }
     \\h1, h2, h3, h4, h5, h6 { margin-top: 1; margin-bottom: 1 }
+    \\html { color: slyph-text }
+    \\a { color: slyph-link }
+    \\h1, h2, h3, h4, h5, h6 { color: slyph-heading }
+    \\hr { color: slyph-rule }
 ;
 
 const Origin = enum(u2) { ua = 0, author = 1, inline_ = 2 };
@@ -354,8 +359,23 @@ fn applyDecl(cs: *ComputedStyle, d: css.Declaration) void {
         cs.font_style = if (eq(v, "italic") or eq(v, "oblique")) .italic else .normal;
     } else if (eq(d.name, "text-decoration") or eq(d.name, "text-decoration-line")) {
         cs.underline = std.mem.indexOf(u8, v, "underline") != null;
+    } else if (eq(d.name, "border") or eq(d.name, "border-style") or eq(d.name, "border-width")) {
+        cs.border = borderVisible(v);
     } else if (eq(d.name, "color")) {
-        if (parseColor(v)) |col| cs.color = col;
+        if (parseColor(v)) |col| {
+            cs.color = col;
+            if (col == .role) cs.color_role = col.role;
+        }
+    } else if (eq(d.name, "background-color")) {
+        if (parseColor(v)) |col| {
+            cs.background = col;
+            if (col == .role) cs.background_role = col.role;
+        }
+    } else if (eq(d.name, "background")) {
+        if (backgroundColorOf(v)) |col| {
+            cs.background = col;
+            if (col == .role) cs.background_role = col.role;
+        }
     } else if (eq(d.name, "margin")) {
         if (firstLineCount(v)) |n| {
             cs.margin_top = n;
@@ -370,6 +390,33 @@ fn applyDecl(cs: *ComputedStyle, d: css.Declaration) void {
     }
 }
 
+fn borderVisible(v: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, v, " \t");
+    var any = false;
+    while (it.next()) |tok| {
+        if (eq(tok, "none") or eq(tok, "hidden")) return false;
+        if (isZeroLength(tok)) return false;
+        any = true;
+    }
+    return any;
+}
+
+fn isZeroLength(tok: []const u8) bool {
+    const digits = tok[0 .. std.mem.indexOfNone(u8, tok, "0123456789.") orelse tok.len];
+    if (digits.len == 0) return false;
+    for (digits) |c| if (c != '0' and c != '.') return false;
+    return true;
+}
+
+fn backgroundColorOf(v: []const u8) ?style.Color {
+    var it = std.mem.tokenizeAny(u8, v, " \t");
+    while (it.next()) |tok| {
+        if (std.ascii.startsWithIgnoreCase(tok, "url(")) continue;
+        if (parseColor(tok)) |col| return col;
+    }
+    return null;
+}
+
 fn firstLineCount(v: []const u8) ?u8 {
     var it = std.mem.tokenizeAny(u8, v, " \t");
     const first = it.next() orelse return null;
@@ -378,6 +425,12 @@ fn firstLineCount(v: []const u8) ?u8 {
 
 fn parseColor(v: []const u8) ?style.Color {
     if (v.len > 0 and v[0] == '#') return parseHex(v[1..]);
+    if (std.ascii.startsWithIgnoreCase(v, "slyph-")) {
+        inline for (@typeInfo(style.Role).@"enum".fields) |f| {
+            if (eq(v["slyph-".len..], f.name)) return .{ .role = @field(style.Role, f.name) };
+        }
+        return null;
+    }
     const named = .{
         .{ "black", 0, 0, 0 },        .{ "white", 255, 255, 255 },
         .{ "red", 255, 0, 0 },        .{ "green", 0, 128, 0 },
@@ -393,23 +446,8 @@ fn parseColor(v: []const u8) ?style.Color {
 }
 
 fn parseHex(h: []const u8) ?style.Color {
-    if (h.len == 3 or h.len == 4) {
-        const r = hexNibble(h[0]) orelse return null;
-        const g = hexNibble(h[1]) orelse return null;
-        const b = hexNibble(h[2]) orelse return null;
-        return .{ .rgb = .{ .r = r * 17, .g = g * 17, .b = b * 17 } };
-    }
-    if (h.len == 6 or h.len == 8) {
-        const r = std.fmt.parseInt(u8, h[0..2], 16) catch return null;
-        const g = std.fmt.parseInt(u8, h[2..4], 16) catch return null;
-        const b = std.fmt.parseInt(u8, h[4..6], 16) catch return null;
-        return .{ .rgb = .{ .r = r, .g = g, .b = b } };
-    }
-    return null;
-}
-
-fn hexNibble(c: u8) ?u8 {
-    return std.fmt.charToDigit(c, 16) catch null;
+    const c = hexRgb(h) orelse return null;
+    return .{ .rgb = .{ .r = c[0], .g = c[1], .b = c[2] } };
 }
 
 const testing = std.testing;
@@ -485,7 +523,7 @@ test "css policy strips denied author property, leaves UA + other props" {
         if (n.kind == .element and std.mem.eql(u8, n.tag, "p")) break;
     }
     const para = pn.?;
-    try testing.expectEqual(style.Color.default, para.computed.?.color);
+    try testing.expectEqual(style.Color{ .role = .text }, para.computed.?.color);
     try testing.expectEqual(style.FontWeight.bold, para.computed.?.font_weight);
     const b = para.first_child.?;
     try testing.expectEqualStrings("b", b.tag);
@@ -542,7 +580,7 @@ test "css policy also strips a denied property from a linked sheet" {
     try apply(doc.alloc(), &doc, "x.com", &p, &sheets);
 
     const para = doc.root.first_child.?.first_child.?.first_child.?;
-    try testing.expectEqual(style.Color.default, para.computed.?.color);
+    try testing.expectEqual(style.Color{ .role = .text }, para.computed.?.color);
 }
 
 test "css policy host-scoped: other host unaffected" {

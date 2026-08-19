@@ -24,6 +24,10 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Fetch a URL and dump its text");
     run_step.dependOn(&run_cmd.step);
 
+    const clean_cmd = b.addSystemCommand(&.{ "rm", "-rf", "zig-out", ".zig-cache" });
+    const clean_step = b.step("clean", "Remove zig-out and the local build cache");
+    clean_step.dependOn(&clean_cmd.step);
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
